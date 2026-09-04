@@ -211,9 +211,7 @@ say which regexes are index-hostile.
   Manager nor log files are reachable.
 * Atlas `includeMetrics` / `includeOpType` response fields are not used yet; the same numbers
   are parsed from the log line, which also works for Ops Manager.
-* `--fail-on <remedy,...>` (non-zero exit when a listed remedy appears) would let CI gate without
-  the `jq` step documented in the README. Deferred until the customer settles on a policy; the
-  README's block/warn/ignore split is the proposed default.
+* ~~`--fail-on <remedy,...>`~~ added the same day, see decision 34.
 
 19. **README quick start and automation guidelines, no integration code.** The customer wanted
     to try the tool and asked how it would fit Ansible / CI. Chosen to document rather than ship
@@ -328,10 +326,33 @@ regex-finder README section and will be composed in later.
     and amber stay for FAIL/WARN only, as status semantics rather than chrome. Verified with
     headless Chrome on both the live WAF scorecard and the fixture regex dashboard.
 
+34. **regex-finder composed into the Performance pillar; `--fail-on` on both tools.** The
+    session's third decision was "Performance Advisor as a CI/CD quality gate". Two changes
+    make that a single command instead of a `jq` recipe:
+    * `regex-finder ... --fail-on search,fix_filter,btree_index` exits 1 after writing the
+      report when any summary row carries a listed remedy (the README's block list is the
+      documented default; the flag has no default so a team must choose). Unknown remedy
+      names are a usage error (exit 2) before any network call.
+    * `waf-check atlas --slow-queries-since 24h` runs the regex-finder pipeline
+      (`list_processes` -> `select_processes` by the cluster's connection-string hosts ->
+      `atlas_lines` -> `analyze_lines` -> `summarize`) as one more fact, `regex_shapes`, and
+      scores it as `perf.regex.index-hostile` (WARN by default). Blocking remedies come from the
+      policy (`performance.regex_block_on`, validated against the `Remedy` enum). Without the
+      flag the check is `NA` with the flag named in the message, because the scan is one
+      request per process and a Data Access role; a read-only key gets `UNKNOWN`, not `FAIL`,
+      like every other fact. Shared tiers are `NA` (no Performance Advisor).
+    * Composition direction is `waf_check -> regex_finder` only; regex-finder stays usable on
+      its own (logfile, live, Ops Manager) and knows nothing about pillars.
+    * Verified live on `cluster-free` with `--slow-queries-since 7d`: 3 of 6 shapes blocking
+      (`search` x2 on `customers.name` / `customers.note`, `fix_filter` on the `update` filter),
+      identical to what `regex-finder atlas` reports on its own.
+    * Small enablers: `ApiError.url` and `atlas_api.hosts_from_connection_string` (pure), so
+      the collector can name the failing endpoint and reuse the host matching without touching
+      private helpers.
+
 ### Known limitations / follow-ups
 
-* Compose regex-finder (and later suggested-index details) into the Performance pillar so one
-  run produces both reports; add `--fail-on` to regex-finder for parity.
+* Suggested-index details (namespace, weight) could join the Performance pillar the same way.
 * Project scope: `waf-check atlas --all-clusters`, reusing project facts.
 * Attestation file for `DISCUSS` items (owner, date, note) so the workshop output is recorded.
 * Idle-cluster cost check needs process measurements (connections over 7 days); deferred.

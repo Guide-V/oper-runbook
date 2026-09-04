@@ -323,7 +323,10 @@ open reports/waf.html
 mongoops waf-check init -i -o landing-zone.prod.yaml
 mongoops waf-check atlas -c <ClusterName> --policy landing-zone.prod.yaml -f json -o reports/waf.json
 
-# 3. See every check id and its default severity (the keys of the policy's `checks:` section)
+# 3. Add the regex-finder scan of the last day's slow queries (Performance pillar) and gate
+mongoops waf-check atlas -c <ClusterName> --slow-queries-since 24h --fail-on warn
+
+# 4. See every check id and its default severity (the keys of the policy's `checks:` section)
 mongoops waf-check checks
 ```
 
@@ -358,7 +361,7 @@ maintenance window, password users). Change any of them in `checks:`.
 
 ### What is checked
 
-29 automatic checks and 17 discussion items; `mongoops waf-check checks` prints the full list.
+30 automatic checks and 17 discussion items; `mongoops waf-check checks` prints the full list.
 Highlights per pillar, with the Admin API evidence:
 
 * **Security**: no `0.0.0.0/0` and no CIDR wider than the policy floor in the access list;
@@ -372,7 +375,11 @@ Highlights per pillar, with the Admin API evidence:
   `criticality` by default), recommended alerts present and enabled, observability integration
   (Datadog, Prometheus, ...) when the policy names one, advisors enabled on the project.
 * **Performance**: compute and storage autoscaling, outstanding Performance Advisor index
-  suggestions, cluster-level `defaultMaxTimeMS` when the policy asks for it.
+  suggestions, cluster-level `defaultMaxTimeMS` when the policy asks for it, and (with
+  `--slow-queries-since 24h`) the regex-finder scan of Performance Advisor slow queries as
+  `perf.regex.index-hostile`: shapes whose remedy is in `performance.regex_block_on`
+  (`search`, `fix_filter`, `btree_index` by default) make it WARN. Without the flag it is `NA`;
+  the scan costs one request per process, so it is opt-in.
 * **Cost**: longest snapshot retention vs the policy ceiling.
 * **Discuss**: org/project layout, Terraform ownership, roles and change control, support and
   training, developer access, federated auth roll-out, CSFLE/Queryable Encryption and the
@@ -386,7 +393,7 @@ Highlights per pillar, with the Admin API evidence:
 | --- | --- | --- |
 | Cluster, processArgs, backup schedule, access list, peers, maintenance window, alert configs, database users, project settings | Project Read Only | (baseline) |
 | `auditLog`, `integrations`, `backupCompliancePolicy` | Project Owner | `sec.audit.enabled`, `ops.integrations.observability`, `rel.backup.compliance-policy` -> `UNKNOWN` |
-| `performanceAdvisor/suggestedIndexes` | Project Data Access Read Only | `perf.advisor.suggested-indexes` -> `UNKNOWN` |
+| `performanceAdvisor/suggestedIndexes`, `performanceAdvisor/slowQueryLogs` | Project Data Access Read Only | `perf.advisor.suggested-indexes`, `perf.regex.index-hostile` -> `UNKNOWN` |
 
 A read-only key is enough for a first report; the HTML lists what it could not read.
 
@@ -486,17 +493,20 @@ something exercised the database, not on a pull request's unit tests. Two placem
 
 Gate policy that has worked in practice: **block** on `search`, `fix_filter` and `btree_index`
 (a real scan with a known fix), **warn** on `collation_index`, `reversed_field` and `rewrite`,
-ignore `none` and `monitor`. Expressed with `jq`:
+ignore `none` and `monitor`. `--fail-on` takes the blocking list and exits 1 when any shape
+carries one of those remedies, after the report has been written:
 
 ```bash
 mongoops regex-finder atlas -c "$CLUSTER" --since "$PIPELINE_START" -n "$NAMESPACES" \
-  -f json -o reports/regex.json --html reports/regex.html
+  -f json -o reports/regex.json --html reports/regex.html \
+  --fail-on search,fix_filter,btree_index
+```
 
-blocking=$(jq '[.summary[] | select(.remedy | IN("search","fix_filter","btree_index"))] | length' reports/regex.json)
-warnings=$(jq '[.summary[] | select(.remedy | IN("collation_index","reversed_field","rewrite"))] | length' reports/regex.json)
-echo "blocking=$blocking warnings=$warnings"
-jq -r '.summary[] | "\(.remedy)\t\(.namespace)\t\(.field)\t\(.sample_pattern)\t\(.remedy_how)"' reports/regex.json
-test "$blocking" -eq 0
+The blocking shapes are printed on stderr (`blocking: shop.products name find -> search`). For a
+separate warning count, or a different split, `jq` over the JSON still works:
+
+```bash
+jq '[.summary[] | select(.remedy | IN("collation_index","reversed_field","rewrite"))] | length' reports/regex.json
 ```
 
 Ratchet instead of a hard rule when starting on a cluster that already has findings: commit the
@@ -525,8 +535,8 @@ regex-gate:
     - run: pip install "git+https://github.com/Guide-V/oper-runbook.git@main"  # pin a tag once released
     - run: |
         mongoops regex-finder atlas -c staging --since "${{ github.event.head_commit.timestamp }}" \
-          -f json -o reports/regex.json --html reports/regex.html
-        test "$(jq '[.summary[] | select(.remedy | IN("search","fix_filter","btree_index"))] | length' reports/regex.json)" -eq 0
+          -f json -o reports/regex.json --html reports/regex.html \
+          --fail-on search,fix_filter,btree_index
     - uses: actions/upload-artifact@v4
       if: always()
       with: { name: regex-dashboard, path: reports/ }
@@ -545,8 +555,10 @@ Practical notes:
   `scripts/dev/atlas_live_check.sh` does.
 * **Keep the dashboard.** Upload `reports/` as an artifact on every run, including failures; the
   "What to do" section is the message to send back to the developer.
-* A native `--fail-on <remedy,...>` flag would remove the `jq` step; it is listed as a follow-up
-  in `spec.md` and easy to add once the team has settled on a policy.
+* **One gate for everything.** `mongoops waf-check atlas -c staging --slow-queries-since
+  "$PIPELINE_START" --fail-on warn` runs the same regex scan as check
+  `perf.regex.index-hostile` alongside the configuration checks, with the blocking remedies
+  taken from the landing-zone policy (`performance.regex_block_on`).
 
 ## Development
 

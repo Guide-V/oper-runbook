@@ -17,7 +17,8 @@ from rich.console import Console
 from rich.table import Table
 
 from mongoops.common import atlas_api
-from mongoops.common.perf_advisor import ApiError
+from mongoops.common.perf_advisor import ApiError, SlowQueryWindow
+from mongoops.common.timeutil import parse_since_ms
 from mongoops.waf_check.catalog import CATALOG, CATALOG_VERSION
 from mongoops.waf_check.checks import evaluate
 from mongoops.waf_check.facts import Facts, collect_atlas, region_configs
@@ -118,6 +119,15 @@ def atlas(
         FailOn,
         typer.Option("--fail-on", help="Exit 1 when a check has this status or worse."),
     ] = FailOn.never,
+    slow_queries_since: Annotated[
+        str | None,
+        typer.Option(
+            "--slow-queries-since",
+            help="Also scan Performance Advisor slow queries from this duration (24h, 7d) or "
+            "ISO instant with regex-finder, for perf.regex.index-hostile. Needs Project Data "
+            "Access Read Only; off by default because it is one request per process.",
+        ),
+    ] = None,
     base_url: Annotated[
         str, typer.Option(envvar="MONGODB_ATLAS_OPS_MANAGER_URL", help="Atlas API base URL.")
     ] = atlas_api.DEFAULT_BASE_URL,
@@ -141,12 +151,18 @@ def atlas(
     except PolicyError as exc:
         _fail(str(exc))
     try:
+        window = (
+            SlowQueryWindow(since_ms=parse_since_ms(slow_queries_since))
+            if slow_queries_since
+            else None
+        )
         with _open_client(base_url) as client:
             facts = collect_atlas(
                 client,
                 project_id,
                 cluster,
                 lambda name, state: err.print(f"[dim]{name}: {state}[/dim]"),
+                slow_query_window=window,
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))

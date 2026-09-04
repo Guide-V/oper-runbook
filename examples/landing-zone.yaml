@@ -61,6 +61,9 @@ performance:
   require_compute_autoscaling: true
   require_disk_autoscaling: true
   max_suggested_indexes: 0
+  # regex-finder remedies that make perf.regex.index-hostile not pass (needs --slow-queries-since):
+  # search, fix_filter, btree_index, collation_index, reversed_field, rewrite, monitor
+  regex_block_on: [search, fix_filter, btree_index]
   require_default_max_time_ms: false
 
 cost:
@@ -96,5 +99,6 @@ checks:
   perf.autoscaling.compute: warn
   perf.autoscaling.disk: warn
   perf.advisor.suggested-indexes: warn
+  perf.regex.index-hostile: warn
   perf.config.default-max-time-ms: warn
   cost.backup.retention: warn

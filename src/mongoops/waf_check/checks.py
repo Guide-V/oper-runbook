@@ -15,6 +15,7 @@ import ipaddress
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from mongoops.regex_finder.summary import SummaryRow
 from mongoops.waf_check.catalog import AUTO_CHECKS, DISCUSS_CHECKS
 from mongoops.waf_check.facts import Fact, Facts, region_configs
 from mongoops.waf_check.model import CheckResult, Outcome, discussion, resolve
@@ -593,6 +594,42 @@ def suggested_indexes(facts: Facts, policy: Policy) -> Outcome:
     )
 
 
+def regex_index_hostile(facts: Facts, policy: Policy) -> Outcome:
+    if (na := _shared(facts, "Performance Advisor")) is not None:
+        return na
+    if not facts.regex_shapes.available:
+        return _unavailable(facts.regex_shapes)
+    if facts.regex_shapes.value is None:
+        return _na("slow queries not scanned; run with --slow-queries-since DURATION")
+    rows: tuple[SummaryRow, ...] = facts.regex_shapes.value
+    blocking = tuple(r for r in rows if r.remedy.value in policy.performance_regex_block_on)
+    shapes = tuple(
+        {
+            "namespace": r.namespace,
+            "field": r.field,
+            "command": r.command,
+            "category": str(r.category),
+            "count": r.count,
+            "max_duration_ms": r.max_duration_ms,
+            "remedy": str(r.remedy),
+        }
+        for r in blocking
+    )
+    return Outcome(
+        ok=not blocking,
+        message=f"{len(blocking)} of {len(rows)} regex shape(s) need {_join_remedies(blocking)}"
+        if blocking
+        else f"{len(rows)} regex shape(s), none index-hostile",
+        evidence={"shapes_total": len(rows), "blocking": shapes},
+        remedy="Run `mongoops regex-finder atlas` for the full breakdown; move text search to "
+        "MongoDB Search, fix write-path filters, and add the missing prefix indexes.",
+    )
+
+
+def _join_remedies(rows: tuple[SummaryRow, ...]) -> str:
+    return ", ".join(sorted({str(r.remedy) for r in rows}))
+
+
 def default_max_time_ms(facts: Facts, policy: Policy) -> Outcome:
     if not policy.performance_require_default_max_time_ms:
         return _na("policy performance.require_default_max_time_ms is false")
@@ -668,6 +705,7 @@ EVALUATORS: Mapping[str, Evaluator] = {
     "perf.autoscaling.compute": autoscaling_compute,
     "perf.autoscaling.disk": autoscaling_disk,
     "perf.advisor.suggested-indexes": suggested_indexes,
+    "perf.regex.index-hostile": regex_index_hostile,
     "perf.config.default-max-time-ms": default_max_time_ms,
     "cost.backup.retention": backup_retention,
 }

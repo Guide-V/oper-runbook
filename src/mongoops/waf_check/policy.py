@@ -18,6 +18,7 @@ from typing import Any
 
 import yaml
 
+from mongoops.regex_finder.remedy import Remedy
 from mongoops.waf_check.catalog import AUTO_CHECKS, BY_ID
 from mongoops.waf_check.model import Kind, Severity
 
@@ -85,6 +86,7 @@ class Policy:
     performance_require_compute_autoscaling: bool = True
     performance_require_disk_autoscaling: bool = True
     performance_max_suggested_indexes: int = 0
+    performance_regex_block_on: tuple[str, ...] = ("search", "fix_filter", "btree_index")
     performance_require_default_max_time_ms: bool = False
     cost_max_snapshot_retention_days: int = 365
     severities: Mapping[str, Severity] = field(
@@ -216,6 +218,10 @@ def policy_from_mapping(data: Any) -> Policy:
             perf.get("max_suggested_indexes", d.performance_max_suggested_indexes),
             "performance.max_suggested_indexes",
         ),
+        performance_regex_block_on=_remedies(
+            perf.get("regex_block_on", d.performance_regex_block_on),
+            "performance.regex_block_on",
+        ),
         performance_require_default_max_time_ms=_bool(
             perf.get("require_default_max_time_ms", d.performance_require_default_max_time_ms),
             "performance.require_default_max_time_ms",
@@ -264,6 +270,15 @@ def _list(value: Any, where: str) -> Sequence[Any]:
     if isinstance(value, str | Mapping):
         raise PolicyError(f"{where}: expected a list")
     return tuple(value)
+
+
+def _remedies(value: Any, where: str) -> tuple[str, ...]:
+    names = tuple(str(v) for v in _list(value, where))
+    allowed = tuple(r.value for r in Remedy)
+    unknown = tuple(n for n in names if n not in allowed)
+    if unknown:
+        raise PolicyError(f"{where}: unknown remedy {', '.join(unknown)}; choose from {allowed}")
+    return names
 
 
 def _alert(item: Any) -> AlertRequirement:
@@ -386,6 +401,9 @@ performance:
   require_compute_autoscaling: {y(policy.performance_require_compute_autoscaling)}
   require_disk_autoscaling: {y(policy.performance_require_disk_autoscaling)}
   max_suggested_indexes: {policy.performance_max_suggested_indexes}
+  # regex-finder remedies that make perf.regex.index-hostile not pass (needs --slow-queries-since):
+  # search, fix_filter, btree_index, collation_index, reversed_field, rewrite, monitor
+  regex_block_on: [{", ".join(policy.performance_regex_block_on)}]
   require_default_max_time_ms: {y(policy.performance_require_default_max_time_ms)}
 
 cost:

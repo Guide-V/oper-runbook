@@ -292,6 +292,15 @@ AUTO_CHECKS: tuple[CheckSpec, ...] = (
         "performance.max_suggested_indexes (needs Project Data Access Read Only).",
     ),
     _auto(
+        "perf.regex.index-hostile",
+        P,
+        "No index-hostile $regex shapes in recent slow queries",
+        WARN,
+        DOC_PERF_ADVISOR,
+        "regex-finder over Performance Advisor slow queries (only with --slow-queries-since): "
+        "shapes whose remedy is in policy performance.regex_block_on block the check.",
+    ),
+    _auto(
         "perf.config.default-max-time-ms",
         P,
         "Cluster-level default query timeout set",

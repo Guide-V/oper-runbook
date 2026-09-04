@@ -22,7 +22,7 @@ from mongoops.waf_check.policy import (
     version_tuple,
 )
 from mongoops.waf_check.report import Scope, render, sort_results
-from tests.waf_fixtures import SHARED_CLUSTER, bad_facts, good_facts
+from tests.waf_fixtures import REGEX_ROWS, SHARED_CLUSTER, bad_facts, good_facts
 
 SCOPE = Scope(cluster="prod-orders", project_id="gid", generated_at="2026-09-04 12:00:00 UTC")
 
@@ -160,6 +160,38 @@ class TestEvaluate:
         assert results["sec.auth.no-password-users"].status is Status.NA
         assert results["sec.network.no-open-access"].status is Status.FAIL  # never relaxed
 
+    def test_regex_check_follows_the_slow_query_scan(self) -> None:
+        """NA until scanned; UNKNOWN when the scan could not read; blocking remedies from policy."""
+        not_scanned = by_id(ck.evaluate(good_facts(), DEFAULT_POLICY))
+        assert not_scanned["perf.regex.index-hostile"].status is Status.NA
+        assert "--slow-queries-since" in not_scanned["perf.regex.index-hostile"].message
+
+        unreadable = good_facts(regex_shapes=Fact(error="HTTP 403 reading ..."))
+        assert (
+            by_id(ck.evaluate(unreadable, DEFAULT_POLICY))["perf.regex.index-hostile"].status
+            is Status.UNKNOWN
+        )
+
+        scanned = good_facts(regex_shapes=Fact(REGEX_ROWS))
+        result = by_id(ck.evaluate(scanned, DEFAULT_POLICY))["perf.regex.index-hostile"]
+        assert result.status is Status.WARN
+        assert result.evidence["shapes_total"] == 2
+        assert [s["remedy"] for s in result.evidence["blocking"]] == ["search"]
+
+        lenient = replace(DEFAULT_POLICY, performance_regex_block_on=("fix_filter",))
+        assert (
+            by_id(ck.evaluate(scanned, lenient))["perf.regex.index-hostile"].status is Status.PASS
+        )
+        strict = replace(DEFAULT_POLICY, performance_regex_block_on=("search", "monitor"))
+        strict_result = by_id(ck.evaluate(scanned, strict))["perf.regex.index-hostile"]
+        assert len(strict_result.evidence["blocking"]) == 2
+
+        shared = good_facts(cluster=SHARED_CLUSTER, regex_shapes=Fact(REGEX_ROWS))
+        assert (
+            by_id(ck.evaluate(shared, DEFAULT_POLICY))["perf.regex.index-hostile"].status
+            is Status.NA
+        )
+
 
 class TestPolicy:
     def test_defaults_round_trip_through_the_generated_file(self, tmp_path: Path) -> None:
@@ -230,6 +262,7 @@ class TestPolicy:
             ({"tls": {"minimum": "SSL3"}}, "tls.minimum"),
             ({"tags": {"required": "application"}}, "expected a list"),
             ({"cluster": {"min_mongodb_major": "latest"}}, "version like 7.0"),
+            ({"performance": {"regex_block_on": ["search", "pray"]}}, "unknown remedy pray"),
             ([], "mapping at the top level"),
         ],
     )

@@ -16,7 +16,11 @@ from typing import Any
 
 import httpx
 
-from mongoops.common.perf_advisor import ApiError, paginate
+from mongoops.common import atlas_api
+from mongoops.common.perf_advisor import ApiError, SlowQueryWindow, paginate
+from mongoops.regex_finder import sources
+from mongoops.regex_finder.analyze import AnalyzeOptions, analyze_lines
+from mongoops.regex_finder.summary import SummaryRow, summarize
 
 ACCEPT_2024 = "application/vnd.atlas.2024-08-05+json"
 
@@ -26,6 +30,7 @@ _ROLE_HINTS: Mapping[str, str] = {
     "/integrations": "Project Owner",
     "/backupCompliancePolicy": "Project Owner",
     "/performanceAdvisor/suggestedIndexes": "Project Data Access Read Only",
+    "/performanceAdvisor/slowQueryLogs": "Project Data Access Read Only",
 }
 
 Progress = Callable[[str, str], None]
@@ -58,6 +63,8 @@ class Facts:
     database_users: Fact = field(default_factory=Fact)
     project_settings: Fact = field(default_factory=Fact)
     suggested_indexes: Fact = field(default_factory=Fact)
+    regex_shapes: Fact = field(default_factory=Fact)
+    """regex-finder summary rows for the slow-query window, or ``Fact(None)`` when not requested."""
 
     @property
     def provider(self) -> str:
@@ -91,10 +98,19 @@ def region_configs(cluster: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
 
 
 def collect_atlas(
-    client: httpx.Client, group_id: str, cluster_name: str, progress: Progress | None = None
+    client: httpx.Client,
+    group_id: str,
+    cluster_name: str,
+    progress: Progress | None = None,
+    *,
+    slow_query_window: SlowQueryWindow | None = None,
 ) -> Facts:
     """Fetch every fact for one cluster. Raises ``ApiError`` only if the cluster itself is
-    unreadable; everything else degrades to ``Fact(error=...)``."""
+    unreadable; everything else degrades to ``Fact(error=...)``.
+
+    ``slow_query_window`` turns on the Performance Advisor slow-query pass (regex-finder) for
+    ``perf.regex.index-hostile``; it costs one request per process and needs a Data Access role.
+    """
     base = f"/groups/{group_id}"
     cl = f"{base}/clusters/{cluster_name}"
     note = progress or (lambda _name, _state: None)
@@ -123,12 +139,45 @@ def collect_atlas(
             lambda: _get(client, f"{cl}/performanceAdvisor/suggestedIndexes", accept=ACCEPT_2024),
         ),
     )
+    if slow_query_window is not None:
+        fetches += (
+            (
+                "regex_shapes",
+                lambda: regex_shapes(client, group_id, cluster, slow_query_window),
+            ),
+        )
     collected: dict[str, Fact] = {}
     for name, fetch in fetches:
         fact = fetch()
         collected[name] = fact
         note(name, "ok" if fact.available else fact.error)
     return Facts(group_id=group_id, cluster_name=cluster_name, cluster=cluster, **collected)
+
+
+def regex_shapes(
+    client: httpx.Client, group_id: str, cluster: Mapping[str, Any], window: SlowQueryWindow
+) -> Fact:
+    """Run the regex-finder pipeline over the cluster's processes and keep the summary rows."""
+    hosts = atlas_api.hosts_from_connection_string(
+        (cluster.get("connectionStrings") or {}).get("standard") or ""
+    )
+    try:
+        processes = atlas_api.select_processes(
+            atlas_api.list_processes(client, group_id), hosts=hosts
+        )
+        if not processes:
+            return Fact(error="no processes matched the cluster's connection string hosts")
+        findings = tuple(
+            analyze_lines(
+                sources.atlas_lines(client, group_id, processes, window), AnalyzeOptions()
+            )
+        )
+    except ApiError as exc:
+        return Fact(error=_describe_api_error(exc, exc.url))
+    except httpx.HTTPError as exc:
+        return Fact(error=f"{type(exc).__name__} while reading Performance Advisor slow queries")
+    rows: tuple[SummaryRow, ...] = summarize(findings)
+    return Fact(value=rows)
 
 
 def _get(client: httpx.Client, url: str, *, accept: str | None = None) -> Fact:
@@ -169,7 +218,7 @@ def _describe_api_error(exc: ApiError, url: str) -> str:
 
 
 def _describe_status(status: int, url: str, detail: str) -> str:
-    tail = url.rsplit("/groups/", 1)[-1]
+    tail = url.split("?", 1)[0].rsplit("/groups/", 1)[-1]
     if status in (401, 403):
         hint = next((role for suffix, role in _ROLE_HINTS.items() if url.endswith(suffix)), "")
         role = f"; this endpoint needs {hint}" if hint else ""

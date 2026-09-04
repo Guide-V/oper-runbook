@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from mongoops.regex_finder.detector import RegexCategory
+from mongoops.regex_finder.remedy import Remedy
+from mongoops.regex_finder.summary import SummaryRow
 from mongoops.waf_check.facts import Fact, Facts
 
 GOOD_CLUSTER: dict[str, Any] = {
@@ -153,6 +156,34 @@ SETTINGS_ON = {
     "isSchemaAdvisorEnabled": True,
     "isRealtimePerformancePanelEnabled": True,
 }
+
+
+def _row(namespace: str, field: str, category: RegexCategory, remedy: Remedy) -> SummaryRow:
+    return SummaryRow(
+        namespace=namespace,
+        field=field,
+        command="find",
+        category=category,
+        count=12,
+        collscan_count=12,
+        max_duration_ms=900,
+        avg_duration_ms=400.0,
+        total_docs_examined=6_000_000,
+        sample_pattern="wid",
+        sample_options="i",
+        origins=1,
+        advice="",
+        remedy=remedy,
+        remedy_how="",
+    )
+
+
+# What regex-finder would summarise for a cluster with one Search-shaped query and one shape
+# too small to act on yet.
+REGEX_ROWS: tuple[SummaryRow, ...] = (
+    _row("shop.products", "name", RegexCategory.CASE_INSENSITIVE, Remedy.SEARCH),
+    _row("shop.audit", "actor", RegexCategory.UNANCHORED, Remedy.MONITOR),
+)
 
 
 def good_facts(**overrides: Any) -> Facts:

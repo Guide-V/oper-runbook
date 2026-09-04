@@ -24,9 +24,39 @@ def _results(items: tuple[dict, ...]) -> httpx.Response:  # type: ignore[type-ar
     return httpx.Response(200, json={"results": list(items), "totalCount": len(items)})
 
 
+# One process per fixture cluster (hosts a/b/c.example.net); only b (dev-scratch) logs an
+# unanchored case-insensitive regex, the shape regex-finder sends to MongoDB Search.
+PROCESSES = (
+    {"id": "a.example.net:27017", "hostname": "a.example.net", "port": 27017},
+    {"id": "b.example.net:27017", "hostname": "b.example.net", "port": 27017},
+)
+HOSTILE_LINE = json.dumps(
+    {
+        "t": {"$date": "2026-09-04T00:00:00.000+00:00"},
+        "msg": "Slow query",
+        "attr": {
+            "type": "command",
+            "ns": "shop.products",
+            "command": {"find": "products", "filter": {"name": {"$regex": "wid", "$options": "i"}}},
+            "planSummary": "COLLSCAN",
+            "durationMillis": 900,
+            "docsExamined": 500000,
+            "nreturned": 3,
+        },
+    }
+)
+
+
 def atlas_handler(req: httpx.Request) -> httpx.Response:
     """A project with one good cluster; auditLog is forbidden; no compliance policy."""
     path = req.url.path.removeprefix(f"{API}/groups/{GID}")
+    if path == "/processes":
+        return _results(PROCESSES)
+    if path.startswith("/processes/") and path.endswith("/performanceAdvisor/slowQueryLogs"):
+        assert "since" in parse_qs(req.url.query.decode())
+        hostile = path.startswith("/processes/b.")
+        lines = [{"line": HOSTILE_LINE, "namespace": "shop.products"}] if hostile else []
+        return httpx.Response(200, json={"slowQueries": lines})
     if path == "/clusters/prod-orders":
         assert req.headers["Accept"] == ACCEPT_2024
         return httpx.Response(200, json=fx.GOOD_CLUSTER)
@@ -123,6 +153,34 @@ def test_fail_on_gates_exit_code() -> None:
         ["waf-check", "atlas", "-p", GID, "-c", "prod-orders", "-f", "json", "--fail-on", "warn"],
     )
     assert warn_gate.exit_code == 0  # good cluster: UNKNOWN does not trip the gate
+
+
+def _check(payload: dict, check_id: str) -> dict:  # type: ignore[type-arg]
+    return next(c for c in payload["checks"] if c["id"] == check_id)
+
+
+def test_slow_query_scan_feeds_the_regex_check() -> None:
+    """Without the flag the check is NA; with it, regex-finder shapes decide the outcome."""
+    base = ["waf-check", "atlas", "-p", GID, "-f", "json"]
+    off = runner.invoke(app, [*base, "-c", "dev-scratch"])
+    assert off.exit_code == 0, off.output
+    assert _check(json.loads(off.stdout), "perf.regex.index-hostile")["status"] == "NA"
+
+    good = runner.invoke(app, [*base, "-c", "prod-orders", "--slow-queries-since", "24h"])
+    assert good.exit_code == 0, good.output
+    assert _check(json.loads(good.stdout), "perf.regex.index-hostile")["status"] == "PASS"
+
+    bad = runner.invoke(
+        app, [*base, "-c", "dev-scratch", "--slow-queries-since", "24h", "--fail-on", "warn"]
+    )
+    assert bad.exit_code == 1, bad.output
+    check = _check(json.loads(bad.stdout), "perf.regex.index-hostile")
+    assert check["status"] == "WARN"
+    assert check["evidence"]["blocking"][0]["remedy"] == "search"
+    assert check["evidence"]["blocking"][0]["namespace"] == "shop.products"
+
+    bad_since = runner.invoke(app, [*base, "-c", "dev-scratch", "--slow-queries-since", "soon"])
+    assert bad_since.exit_code == 2
 
 
 def test_unknown_cluster_is_a_usage_error() -> None:
