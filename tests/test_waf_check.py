@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import pytest
 import yaml
 
 from mongoops.waf_check import checks as ck
+from mongoops.waf_check.attest import (
+    AttestationError,
+    apply_attestations,
+    attestations_from_mapping,
+    load_attestations,
+    render_attestations_yaml,
+)
 from mongoops.waf_check.catalog import AUTO_CHECKS, CATALOG, DISCUSS_CHECKS
 from mongoops.waf_check.facts import Fact
 from mongoops.waf_check.model import Kind, Pillar, Severity, Status
@@ -289,6 +297,120 @@ class TestPolicy:
         assert version_tuple("8.0") == (8, 0)
         assert version_tuple("7.0.12-ent") == (7, 0, 12)
         assert version_tuple("6.0") < version_tuple("7.0")
+
+
+class TestAttest:
+    FILLED = """
+    valid_days: 180
+    attestations:
+      ops.discuss.infrastructure-as-code:
+        status: pass
+        owner: platform-team
+        date: 2026-08-01
+        note: terraform-atlas repo, PR review required
+      rel.discuss.dr-runbook-and-drill:
+        status: fail
+        owner: sre
+        date: 2026-08-15
+        note: no restore drill yet, planned Q4
+      sec.discuss.compliance-standards:
+        status: na
+        owner: ciso
+        date: 2026-01-10
+        note: internal only
+      perf.discuss.schema-and-index-review:
+        status: open
+    """
+
+    def test_template_round_trips_and_lists_every_discussion_item(self, tmp_path: Path) -> None:
+        text = render_attestations_yaml()
+        path = tmp_path / "attestations.yaml"
+        path.write_text(text)
+        loaded = load_attestations(path)
+        assert loaded.items == {} and loaded.valid_days == 365 and loaded.path == str(path)
+        assert all(f"  {c.id}:" in text for c in DISCUSS_CHECKS)
+
+    def test_checked_in_example_matches_the_generator(self) -> None:
+        example = Path(__file__).resolve().parents[1] / "examples" / "attestations.yaml"
+        assert example.read_text() == render_attestations_yaml(), (
+            "examples/attestations.yaml drifted: run `mongoops waf-check attest-init -o "
+            "examples/attestations.yaml --force`"
+        )
+
+    def test_attested_items_take_the_recorded_status(self) -> None:
+        attestations = attestations_from_mapping(yaml.safe_load(self.FILLED))
+        assert set(attestations.items) == {
+            "ops.discuss.infrastructure-as-code",
+            "rel.discuss.dr-runbook-and-drill",
+            "sec.discuss.compliance-standards",
+        }
+        results = by_id(
+            apply_attestations(
+                ck.evaluate(good_facts(), DEFAULT_POLICY),
+                attestations,
+                today=date(2026, 9, 4),
+            )
+        )
+        iac = results["ops.discuss.infrastructure-as-code"]
+        assert iac.status is Status.PASS and iac.kind is Kind.DISCUSS
+        assert iac.message == "terraform-atlas repo, PR review required"
+        assert iac.evidence["owner"] == "platform-team" and iac.evidence["date"] == "2026-08-01"
+        dr = results["rel.discuss.dr-runbook-and-drill"]
+        assert dr.status is Status.FAIL
+        assert dr.remedy  # the catalog's "what to settle" becomes the remedy
+        # expired (2026-01-10 + 180 days < 2026-09-04): back to DISCUSS, old answer shown
+        expired = results["sec.discuss.compliance-standards"]
+        assert expired.status is Status.DISCUSS
+        assert "older than 180 days" in expired.message and expired.evidence["expired"] is True
+        assert results["perf.discuss.schema-and-index-review"].status is Status.DISCUSS
+        assert results["perf.discuss.schema-and-index-review"].evidence == {}
+        # auto checks are untouched
+        assert results["sec.network.no-open-access"].status is Status.PASS
+
+    def test_render_shows_attestations_and_gate_sees_them(self) -> None:
+        attestations = attestations_from_mapping(yaml.safe_load(self.FILLED))
+        results = apply_attestations(
+            ck.evaluate(good_facts(), DEFAULT_POLICY), attestations, today=date(2026, 9, 4)
+        )
+        payload = json.loads(render(results, SCOPE, fmt="json"))
+        entry = next(d for d in payload["discuss"] if d["id"] == "rel.discuss.dr-runbook-and-drill")
+        assert entry["status"] == "FAIL" and entry["owner"] == "sre"
+        assert payload["summary"]["by_status"]["FAIL"] == 1
+        html = render(results, SCOPE, fmt="html")
+        assert "attested" in html and "(sre, 2026-08-15)" in html
+        assert "Discuss these (15 open of 17)" in html
+        table = render(results, SCOPE, fmt="table")
+        assert "15 open of 17" in table
+
+    @pytest.mark.parametrize(
+        ("doc", "fragment"),
+        [
+            ({"attestations": {"sec.audit.enabled": {"status": "pass"}}}, "not a discussion item"),
+            ({"attestations": {"nope": {"status": "pass"}}}, "not a discussion item"),
+            (
+                {"attestations": {"rel.discuss.dr-runbook-and-drill": {"status": "done"}}},
+                "open, pass, fail, warn or na",
+            ),
+            (
+                {"attestations": {"rel.discuss.dr-runbook-and-drill": {"status": "pass", "date": "2026"}}},
+                "owner: required",
+            ),
+            (
+                {
+                    "attestations": {
+                        "rel.discuss.dr-runbook-and-drill": {"status": "pass", "owner": "x", "date": "soon"}
+                    }
+                },
+                "YYYY-MM-DD",
+            ),
+            ({"valid_days": 0}, "positive integer"),
+            ({"extra": 1}, "unknown top-level"),
+            ([], "mapping at the top level"),
+        ],
+    )
+    def test_rejects_bad_files_with_a_pointer(self, doc: object, fragment: str) -> None:
+        with pytest.raises(AttestationError, match=fragment):
+            attestations_from_mapping(doc)
 
 
 class TestRender:

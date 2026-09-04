@@ -19,6 +19,14 @@ from rich.table import Table
 from mongoops.common import atlas_api
 from mongoops.common.perf_advisor import ApiError, SlowQueryWindow
 from mongoops.common.timeutil import parse_since_ms
+from mongoops.waf_check.attest import (
+    NO_ATTESTATIONS,
+    AttestationError,
+    apply_attestations,
+    attestations_from_mapping,
+    load_attestations,
+    render_attestations_yaml,
+)
 from mongoops.waf_check.catalog import CATALOG, CATALOG_VERSION
 from mongoops.waf_check.checks import evaluate
 from mongoops.waf_check.facts import Facts, collect_atlas, region_configs
@@ -69,7 +77,9 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _scope(facts: Facts, policy: Policy, policy_path: Path | None) -> Scope:
+def _scope(
+    facts: Facts, policy: Policy, policy_path: Path | None, attest_path: Path | None = None
+) -> Scope:
     tier = next(
         (
             str((rc.get("electableSpecs") or {}).get("instanceSize") or "")
@@ -88,6 +98,7 @@ def _scope(facts: Facts, policy: Policy, policy_path: Path | None) -> Scope:
         ),
         policy_profile=policy.profile,
         policy_path=str(policy_path) if policy_path else "built-in defaults",
+        attestations_path=str(attest_path) if attest_path else "",
     )
 
 
@@ -113,6 +124,13 @@ def atlas(
         typer.Option(
             "--policy",
             help="Landing-zone policy YAML (see `waf-check init`). Default: MongoDB defaults.",
+        ),
+    ] = None,
+    attest_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--attest",
+            help="Attestation YAML for the discussion items (see `waf-check attest-init`).",
         ),
     ] = None,
     fail_on: Annotated[
@@ -148,7 +166,8 @@ def atlas(
     """
     try:
         policy = load_policy(policy_file) if policy_file else DEFAULT_POLICY
-    except PolicyError as exc:
+        attestations = load_attestations(attest_file) if attest_file else NO_ATTESTATIONS
+    except (PolicyError, AttestationError) as exc:
         _fail(str(exc))
     try:
         window = (
@@ -166,8 +185,8 @@ def atlas(
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
-    results = evaluate(facts, policy)
-    scope = _scope(facts, policy, policy_file)
+    results = apply_attestations(evaluate(facts, policy), attestations)
+    scope = _scope(facts, policy, policy_file, attest_file)
     text = render(results, scope, fmt=fmt.value)
     if output:
         _write(output, text)
@@ -205,6 +224,25 @@ def init(
     err.print(
         f"[green]Wrote {output}[/green]. Edit it, then run "
         f"`mongoops waf-check atlas -c <cluster> --policy {output}`."
+    )
+
+
+@app.command("attest-init")
+def attest_init(
+    output: Annotated[
+        Path, typer.Option("--output", "-o", help="Where to write the attestation file.")
+    ] = Path("attestations.yaml"),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+) -> None:
+    """Write the attestation template: every discussion item with status open."""
+    if output.exists() and not force:
+        _fail(f"{output} exists; use --force to overwrite")
+    text = render_attestations_yaml()
+    attestations_from_mapping(yaml.safe_load(text))  # the file we write must load back
+    _write(output, text)
+    err.print(
+        f"[green]Wrote {output}[/green]. Record each decision (status, owner, date, note), then "
+        f"run `mongoops waf-check atlas -c <cluster> --attest {output}`."
     )
 
 

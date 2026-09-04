@@ -18,6 +18,7 @@ from mongoops.waf_check.model import PILLAR_LABEL, CheckResult, Kind, Pillar, St
 from mongoops.waf_check.report import (
     ACTION_STATUSES,
     Scope,
+    attested_by,
     count_by_pillar,
     count_by_status,
     sort_results,
@@ -53,7 +54,7 @@ def render_html(results: Sequence[CheckResult], scope: Scope) -> str:
         (
             _kpis(results),
             _pillars(results),
-            _action_section(auto),
+            _action_section(results),
             _unknown_section(auto),
             _all_checks(auto),
             _discuss_section(discuss),
@@ -93,6 +94,7 @@ def _chips(scope: Scope, generated: str) -> str:
         ("mongodb", scope.version),
         ("policy", scope.policy_profile),
         ("policy file", scope.policy_path),
+        ("attestations", scope.attestations_path),
         ("generated", generated),
     )
     chips = "".join(
@@ -133,16 +135,18 @@ def _pillars(results: Sequence[CheckResult]) -> str:
     return f'<section><h2>By pillar</h2><div class="pillars">{cards}</div></section>'
 
 
-def _action_section(auto: Sequence[CheckResult]) -> str:
-    actions = tuple(r for r in auto if r.status in ACTION_STATUSES)
+def _action_section(results: Sequence[CheckResult]) -> str:
+    """FAIL / WARN from the auto checks and from attested discussion items, worst first."""
+    actions = tuple(r for r in sort_results(results) if r.status in ACTION_STATUSES)
     if not actions:
         cards = '<div class="card">Every evaluated check passes the policy.</div>'
     else:
         cards = "".join(
             f'<div class="card {_STATUS_CLASS[r.status]}"><h3>{_badge(r.status)} '
             f'{escape(r.title)}<span class="n">{escape(r.id)} &middot; '
-            f"{escape(PILLAR_LABEL[r.pillar])}</span></h3>"
-            f"<div>{escape(r.message)}</div>"
+            f"{escape(PILLAR_LABEL[r.pillar])}"
+            f"{' &middot; attested' if r.kind is Kind.DISCUSS else ''}</span></h3>"
+            f"<div>{escape(r.message + attested_by(r))}</div>"
             f"<div><b>Fix:</b> {escape(r.remedy)}"
             f'<a class="doc" href="{escape(r.doc)}">docs</a></div>'
             f'<div class="evidence">{escape(_evidence(r.evidence))}</div></div>'
@@ -196,11 +200,14 @@ def _all_checks(auto: Sequence[CheckResult]) -> str:
 
 def _discuss_section(discuss: Sequence[CheckResult]) -> str:
     groups = {p: tuple(r for r in discuss if r.pillar is p) for p in Pillar}
+    open_items = sum(1 for r in discuss if r.status is Status.DISCUSS)
     cards = "".join(
         f'<div class="card search"><h3>{escape(PILLAR_LABEL[p])}'
-        f'<span class="n">{len(rows)} topic(s)</span></h3><ul>'
+        f'<span class="n">{sum(1 for r in rows if r.status is Status.DISCUSS)} open of '
+        f"{len(rows)}</span></h3><ul>"
         + "".join(
-            f"<li><b>{escape(r.title)}</b>: {escape(r.message)}"
+            f"<li>{_badge(r.status)} <b>{escape(r.title)}</b>: "
+            f"{escape(r.message + attested_by(r))}"
             f'<a class="doc" href="{escape(r.doc)}">docs</a></li>'
             for r in rows
         )
@@ -209,9 +216,10 @@ def _discuss_section(discuss: Sequence[CheckResult]) -> str:
         if rows
     )
     return (
-        f"<section><h2>Discuss these ({len(discuss)})</h2>"
+        f"<section><h2>Discuss these ({open_items} open of {len(discuss)})</h2>"
         '<div class="note">People and process items the API cannot see. Settle them in the '
-        "landing-zone workshop; the tool lists them so they are not forgotten.</div>"
+        "landing-zone workshop and record the outcome with <code>waf-check attest-init</code> "
+        "and <code>--attest FILE</code>; attested items take the recorded status.</div>"
         f'<div class="todo">{cards}</div></section>'
     )
 

@@ -244,6 +244,33 @@ def test_init_writes_loadable_policy(tmp_path: Path) -> None:
     assert "require_customer_managed_keys: false" in text
 
 
+def test_attest_init_then_attested_run_gates(tmp_path: Path) -> None:
+    target = tmp_path / "attestations.yaml"
+    result = runner.invoke(app, ["waf-check", "attest-init", "-o", str(target)])
+    assert result.exit_code == 0, result.output
+    again = runner.invoke(app, ["waf-check", "attest-init", "-o", str(target)])
+    assert again.exit_code == 2 and "exists" in again.output
+    # fill one item in as the workshop would
+    text = target.read_text().replace(
+        "  rel.discuss.dr-runbook-and-drill:\n    status: open\n    owner:\n    date:\n    note:",
+        "  rel.discuss.dr-runbook-and-drill:\n    status: fail\n    owner: sre\n"
+        "    date: 2099-01-01\n    note: no restore drill yet",
+    )
+    target.write_text(text)
+    base = ["waf-check", "atlas", "-p", GID, "-c", "prod-orders", "-f", "json"]
+    gated = runner.invoke(app, [*base, "--attest", str(target), "--fail-on", "fail"])
+    assert gated.exit_code == 1, gated.output
+    payload = json.loads(gated.stdout)
+    assert payload["scope"]["attestations_path"] == str(target)
+    entry = next(d for d in payload["discuss"] if d["id"] == "rel.discuss.dr-runbook-and-drill")
+    assert entry["status"] == "FAIL" and entry["note"] == "no restore drill yet"
+    assert payload["summary"]["by_status"]["DISCUSS"] == 16
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("attestations: {sec.audit.enabled: {status: pass}}\n")
+    broken = runner.invoke(app, [*base, "--attest", str(bad)])
+    assert broken.exit_code == 2 and "not a discussion item" in broken.output
+
+
 def test_checks_lists_catalog() -> None:
     result = runner.invoke(app, ["waf-check", "checks", "-f", "json"])
     ids = {c["id"] for c in json.loads(result.stdout)}

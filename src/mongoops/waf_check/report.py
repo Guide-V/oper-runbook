@@ -38,6 +38,7 @@ class Scope:
     version: str = ""
     policy_profile: str = ""
     policy_path: str = ""
+    attestations_path: str = ""
     generated_at: str = ""
 
     def resolved_time(self) -> str:
@@ -80,19 +81,22 @@ def render_json(results: Sequence[CheckResult], scope: Scope) -> str:
         "scope": {**asdict(scope), "generated_at": scope.resolved_time()},
         "summary": {"by_status": count_by_status(results), "by_pillar": count_by_pillar(results)},
         "checks": [r.to_dict() for r in sort_results(results) if r.kind is Kind.AUTO],
-        "discuss": [
-            {
-                "id": r.id,
-                "pillar": r.pillar.value,
-                "title": r.title,
-                "what": r.message,
-                "doc": r.doc,
-            }
-            for r in results
-            if r.kind is Kind.DISCUSS
-        ],
+        "discuss": [discuss_entry(r) for r in results if r.kind is Kind.DISCUSS],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False, default=_jsonable)
+
+
+def discuss_entry(r: CheckResult) -> dict[str, Any]:
+    """A discussion item for JSON: the open question, or the attestation that settled it."""
+    return {
+        "id": r.id,
+        "pillar": r.pillar.value,
+        "title": r.title,
+        "status": r.status.value,
+        "what": r.message,
+        "doc": r.doc,
+        **{k: r.evidence[k] for k in ("owner", "date", "note", "expired") if k in r.evidence},
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -159,9 +163,26 @@ def _checks_table(results: Sequence[CheckResult]) -> Table:
 
 
 def _discuss_table(results: Sequence[CheckResult]) -> Table:
-    t = Table(title=f"Discuss these ({len(results)}): not visible to the API", show_lines=False)
-    for col in ("id", "pillar", "topic", "what to settle"):
+    open_items = sum(1 for r in results if r.status is Status.DISCUSS)
+    t = Table(
+        title=f"Discuss these ({open_items} open of {len(results)}): not visible to the API",
+        show_lines=False,
+    )
+    for col in ("status", "id", "pillar", "topic", "what to settle / decision"):
         t.add_column(col, overflow="fold")
     for r in results:
-        t.add_row(r.id, PILLAR_LABEL[r.pillar], r.title, r.message)
+        t.add_row(
+            f"[{_STATUS_STYLE[r.status]}]{r.status.value}[/]",
+            r.id,
+            PILLAR_LABEL[r.pillar],
+            r.title,
+            r.message + attested_by(r),
+        )
     return t
+
+
+def attested_by(r: CheckResult) -> str:
+    """`` (owner, date)`` suffix for an attested discussion item, else empty. Pure."""
+    if "owner" not in r.evidence:
+        return ""
+    return f" ({r.evidence['owner']}, {r.evidence['date']})"
