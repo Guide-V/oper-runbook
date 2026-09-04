@@ -11,6 +11,7 @@ dependencies = [
   "typer>=0.16",
   "rich>=14",
   "python-dotenv>=1.1",
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +20,7 @@ dev = [
   "pytest-cov>=6",
   "ruff>=0.12",
   "mypy>=1.17",
+  "types-PyYAML>=6.0",
 ]
 
 [project.scripts]

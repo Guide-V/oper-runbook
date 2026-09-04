@@ -29,6 +29,7 @@ class ApiError(RuntimeError):
             f"{response.request.method} {response.request.url} -> {response.status_code}: {detail}"
         )
         self.status_code = response.status_code
+        self.url = str(response.request.url)
 
 
 @dataclass(frozen=True, slots=True)
