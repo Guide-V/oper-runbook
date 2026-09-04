@@ -50,6 +50,8 @@ HOSTILE_LINE = json.dumps(
 def atlas_handler(req: httpx.Request) -> httpx.Response:
     """A project with one good cluster; auditLog is forbidden; no compliance policy."""
     path = req.url.path.removeprefix(f"{API}/groups/{GID}")
+    if path == "/clusters":
+        return _results((fx.BAD_CLUSTER, fx.GOOD_CLUSTER))
     if path == "/processes":
         return _results(PROCESSES)
     if path.startswith("/processes/") and path.endswith("/performanceAdvisor/slowQueryLogs"):
@@ -181,6 +183,61 @@ def test_slow_query_scan_feeds_the_regex_check() -> None:
 
     bad_since = runner.invoke(app, [*base, "-c", "dev-scratch", "--slow-queries-since", "soon"])
     assert bad_since.exit_code == 2
+
+
+def test_all_clusters_scores_the_project_with_one_project_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def counting(req: httpx.Request) -> httpx.Response:
+        calls.append(req.url.path.removeprefix(f"{API}/groups/{GID}"))
+        return atlas_handler(req)
+
+    monkeypatch.setattr(
+        waf_cli,
+        "_open_client",
+        lambda _b: httpx.Client(
+            transport=httpx.MockTransport(counting), base_url=f"https://x{API}"
+        ),
+    )
+    html = tmp_path / "project.html"
+    result = runner.invoke(
+        app,
+        ["waf-check", "atlas", "-p", GID, "--all-clusters", "-f", "json", "--html", str(html)],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["scope"]["clusters"] == ["dev-scratch", "prod-orders"]
+    assert [c["scope"]["cluster"] for c in payload["clusters"]] == ["dev-scratch", "prod-orders"]
+    assert payload["summary"]["by_cluster"]["dev-scratch"]["FAIL"] > 0
+    assert payload["summary"]["by_cluster"]["prod-orders"]["FAIL"] == 0
+    assert payload["summary"]["by_status"]["DISCUSS"] == 17  # listed once, not per cluster
+    assert "discuss" not in payload["clusters"][0]
+    # project facts once, cluster facts per cluster
+    assert calls.count("/accessList") == 1 and calls.count("/alertConfigs") == 1
+    assert calls.count("/clusters/prod-orders/processArgs") == 1
+    assert calls.count("/clusters/dev-scratch/processArgs") == 1
+    page = html.read_text()
+    assert 'id="cluster-dev-scratch"' in page and 'id="cluster-prod-orders"' in page
+    assert "Action needed across clusters" in page
+
+    table = runner.invoke(app, ["waf-check", "atlas", "-p", GID, "--all-clusters"])
+    assert table.exit_code == 0, table.output
+    assert "2 cluster(s)" in table.stdout and "Clusters (2)" in table.stdout
+    gated = runner.invoke(
+        app, ["waf-check", "atlas", "-p", GID, "--all-clusters", "-f", "json", "--fail-on", "fail"]
+    )
+    assert gated.exit_code == 1  # dev-scratch fails
+
+
+def test_cluster_and_all_clusters_are_exclusive() -> None:
+    neither = runner.invoke(app, ["waf-check", "atlas", "-p", GID])
+    assert neither.exit_code == 2 and "exactly one" in neither.output
+    both = runner.invoke(
+        app, ["waf-check", "atlas", "-p", GID, "-c", "prod-orders", "--all-clusters"]
+    )
+    assert both.exit_code == 2
 
 
 def test_unknown_cluster_is_a_usage_error() -> None:

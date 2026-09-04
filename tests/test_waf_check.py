@@ -392,13 +392,21 @@ class TestAttest:
                 "open, pass, fail, warn or na",
             ),
             (
-                {"attestations": {"rel.discuss.dr-runbook-and-drill": {"status": "pass", "date": "2026"}}},
+                {
+                    "attestations": {
+                        "rel.discuss.dr-runbook-and-drill": {"status": "pass", "date": "2026"}
+                    }
+                },
                 "owner: required",
             ),
             (
                 {
                     "attestations": {
-                        "rel.discuss.dr-runbook-and-drill": {"status": "pass", "owner": "x", "date": "soon"}
+                        "rel.discuss.dr-runbook-and-drill": {
+                            "status": "pass",
+                            "owner": "x",
+                            "date": "soon",
+                        }
                     }
                 },
                 "YYYY-MM-DD",

@@ -97,6 +97,11 @@ def region_configs(cluster: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
 # --- collection -----------------------------------------------------------------------------------
 
 
+Fetches = tuple[tuple[str, Callable[[], Fact]], ...]
+ProjectFacts = Mapping[str, Fact]
+"""Facts shared by every cluster of a project, keyed by ``Facts`` field name."""
+
+
 def collect_atlas(
     client: httpx.Client,
     group_id: str,
@@ -111,6 +116,51 @@ def collect_atlas(
     ``slow_query_window`` turns on the Performance Advisor slow-query pass (regex-finder) for
     ``perf.regex.index-hostile``; it costs one request per process and needs a Data Access role.
     """
+    project = collect_project(client, group_id, progress)
+    return collect_cluster(
+        client, group_id, cluster_name, project, progress, slow_query_window=slow_query_window
+    )
+
+
+def list_cluster_names(client: httpx.Client, group_id: str) -> tuple[str, ...]:
+    """Every cluster name in the project, sorted. Raises ``ApiError`` when unreadable."""
+    return tuple(
+        sorted(
+            str(c["name"])
+            for c in paginate(client, f"/groups/{group_id}/clusters")
+            if c.get("name")
+        )
+    )
+
+
+def collect_project(
+    client: httpx.Client, group_id: str, progress: Progress | None = None
+) -> ProjectFacts:
+    """The project-level facts, fetched once however many clusters are scored."""
+    base = f"/groups/{group_id}"
+    fetches: Fetches = (
+        ("compliance_policy", lambda: _get(client, f"{base}/backupCompliancePolicy")),
+        ("access_list", lambda: _list(client, f"{base}/accessList")),
+        ("audit", lambda: _get(client, f"{base}/auditLog")),
+        ("maintenance_window", lambda: _get(client, f"{base}/maintenanceWindow")),
+        ("alert_configs", lambda: _list(client, f"{base}/alertConfigs")),
+        ("integrations", lambda: _list(client, f"{base}/integrations")),
+        ("database_users", lambda: _list(client, f"{base}/databaseUsers")),
+        ("project_settings", lambda: _get(client, f"{base}/settings")),
+    )
+    return _run(fetches, progress)
+
+
+def collect_cluster(
+    client: httpx.Client,
+    group_id: str,
+    cluster_name: str,
+    project: ProjectFacts,
+    progress: Progress | None = None,
+    *,
+    slow_query_window: SlowQueryWindow | None = None,
+) -> Facts:
+    """The cluster resource plus its cluster-level facts, merged with the project facts."""
     base = f"/groups/{group_id}"
     cl = f"{base}/clusters/{cluster_name}"
     note = progress or (lambda _name, _state: None)
@@ -119,21 +169,13 @@ def collect_atlas(
     if response.is_error:  # includes 404: a wrong cluster name is a usage error, not a finding
         raise ApiError(response)
     cluster: Mapping[str, Any] = response.json()
-    facts = Facts(group_id=group_id, cluster_name=cluster_name, cluster=cluster)
+    shell = Facts(group_id=group_id, cluster_name=cluster_name, cluster=cluster)
     note("cluster", "ok")
 
-    fetches: tuple[tuple[str, Callable[[], Fact]], ...] = (
+    fetches: Fetches = (
         ("process_args", lambda: _get(client, f"{cl}/processArgs", accept=ACCEPT_2024)),
         ("backup_schedule", lambda: _get(client, f"{cl}/backup/schedule", accept=ACCEPT_2024)),
-        ("compliance_policy", lambda: _get(client, f"{base}/backupCompliancePolicy")),
-        ("access_list", lambda: _list(client, f"{base}/accessList")),
-        ("peers", lambda: _list(client, f"{base}/peers", {"providerName": facts.provider})),
-        ("audit", lambda: _get(client, f"{base}/auditLog")),
-        ("maintenance_window", lambda: _get(client, f"{base}/maintenanceWindow")),
-        ("alert_configs", lambda: _list(client, f"{base}/alertConfigs")),
-        ("integrations", lambda: _list(client, f"{base}/integrations")),
-        ("database_users", lambda: _list(client, f"{base}/databaseUsers")),
-        ("project_settings", lambda: _get(client, f"{base}/settings")),
+        ("peers", lambda: _list(client, f"{base}/peers", {"providerName": shell.provider})),
         (
             "suggested_indexes",
             lambda: _get(client, f"{cl}/performanceAdvisor/suggestedIndexes", accept=ACCEPT_2024),
@@ -141,17 +183,25 @@ def collect_atlas(
     )
     if slow_query_window is not None:
         fetches += (
-            (
-                "regex_shapes",
-                lambda: regex_shapes(client, group_id, cluster, slow_query_window),
-            ),
+            ("regex_shapes", lambda: regex_shapes(client, group_id, cluster, slow_query_window)),
         )
+    return Facts(
+        group_id=group_id,
+        cluster_name=cluster_name,
+        cluster=cluster,
+        **project,
+        **_run(fetches, progress),
+    )
+
+
+def _run(fetches: Fetches, progress: Progress | None) -> dict[str, Fact]:
+    note = progress or (lambda _name, _state: None)
     collected: dict[str, Fact] = {}
     for name, fetch in fetches:
         fact = fetch()
         collected[name] = fact
         note(name, "ok" if fact.available else fact.error)
-    return Facts(group_id=group_id, cluster_name=cluster_name, cluster=cluster, **collected)
+    return collected
 
 
 def regex_shapes(

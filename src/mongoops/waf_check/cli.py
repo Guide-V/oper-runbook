@@ -22,6 +22,7 @@ from mongoops.common.timeutil import parse_since_ms
 from mongoops.waf_check.attest import (
     NO_ATTESTATIONS,
     AttestationError,
+    Attestations,
     apply_attestations,
     attestations_from_mapping,
     load_attestations,
@@ -29,7 +30,14 @@ from mongoops.waf_check.attest import (
 )
 from mongoops.waf_check.catalog import CATALOG, CATALOG_VERSION
 from mongoops.waf_check.checks import evaluate
-from mongoops.waf_check.facts import Facts, collect_atlas, region_configs
+from mongoops.waf_check.facts import (
+    Facts,
+    ProjectFacts,
+    collect_cluster,
+    collect_project,
+    list_cluster_names,
+    region_configs,
+)
 from mongoops.waf_check.model import PILLAR_LABEL, CheckResult, Status
 from mongoops.waf_check.policy import (
     DEFAULT_POLICY,
@@ -40,11 +48,18 @@ from mongoops.waf_check.policy import (
     policy_from_mapping,
     render_policy_yaml,
 )
-from mongoops.waf_check.report import Scope, render
+from mongoops.waf_check.report import (
+    ClusterReport,
+    ProjectScope,
+    Scope,
+    project_results,
+    render,
+    render_project,
+)
 
 app = typer.Typer(
     name="waf-check",
-    help="Atlas Well-Architected readiness scorecard for one cluster (read-only).",
+    help="Atlas Well-Architected readiness scorecard per cluster or project (read-only).",
     no_args_is_help=True,
 )
 err = Console(stderr=True)
@@ -118,7 +133,16 @@ def atlas(
         str,
         typer.Option("--project-id", "-p", envvar="MONGODB_ATLAS_PROJECT_ID", help="Project id."),
     ],
-    cluster: Annotated[str, typer.Option("--cluster", "-c", help="Cluster name to score.")],
+    cluster: Annotated[
+        str | None, typer.Option("--cluster", "-c", help="Cluster name to score.")
+    ] = None,
+    all_clusters: Annotated[
+        bool,
+        typer.Option(
+            "--all-clusters",
+            help="Score every cluster in the project (project facts are fetched once).",
+        ),
+    ] = False,
     policy_file: Annotated[
         Path | None,
         typer.Option(
@@ -158,12 +182,15 @@ def atlas(
         typer.Option("--html", help="Also write the self-contained HTML scorecard to this file."),
     ] = None,
 ) -> None:
-    """Score one cluster: Atlas Admin API facts x landing-zone policy -> pillar scorecard.
+    """Score a cluster (-c) or every cluster (--all-clusters): Atlas Admin API facts x
+    landing-zone policy -> pillar scorecard.
 
     Read-only. Needs Project Read Only for most checks; auditLog and integrations need
     Project Owner and Performance Advisor needs Project Data Access Read Only. Checks the key
     cannot read are reported as UNKNOWN, never as failures.
     """
+    if bool(cluster) == all_clusters:
+        _fail("pass exactly one of --cluster NAME or --all-clusters")
     try:
         policy = load_policy(policy_file) if policy_file else DEFAULT_POLICY
         attestations = load_attestations(attest_file) if attest_file else NO_ATTESTATIONS
@@ -176,25 +203,49 @@ def atlas(
             else None
         )
         with _open_client(base_url) as client:
-            facts = collect_atlas(
-                client,
-                project_id,
-                cluster,
-                lambda name, state: err.print(f"[dim]{name}: {state}[/dim]"),
-                slow_query_window=window,
+            project = collect_project(client, project_id, _progress)
+            names = list_cluster_names(client, project_id) if all_clusters else (cluster or "",)
+            if not names:
+                _fail(f"project {project_id} has no clusters")
+            reports = tuple(
+                _score_cluster(
+                    client,
+                    project_id,
+                    name,
+                    project,
+                    window,
+                    policy,
+                    attestations,
+                    policy_file,
+                    attest_file,
+                )
+                for name in names
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
-    results = apply_attestations(evaluate(facts, policy), attestations)
-    scope = _scope(facts, policy, policy_file, attest_file)
-    text = render(results, scope, fmt=fmt.value)
+    if all_clusters:
+        scope = ProjectScope(
+            project_id=project_id,
+            clusters=names,
+            policy_profile=policy.profile,
+            policy_path=str(policy_file) if policy_file else "built-in defaults",
+            attestations_path=str(attest_file) if attest_file else "",
+        )
+        results = project_results(reports)
+        text = render_project(reports, scope, fmt=fmt.value)
+        html_text = render_project(reports, scope, fmt="html") if html else ""
+    else:
+        (report,) = reports
+        results = report.results
+        text = render(results, report.scope, fmt=fmt.value)
+        html_text = render(results, report.scope, fmt="html") if html else ""
     if output:
         _write(output, text)
         err.print(f"[green]Wrote {output}[/green]")
     else:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
     if html:
-        _write(html, render(results, scope, fmt="html"))
+        _write(html, html_text)
         err.print(f"[green]Scorecard: {html.resolve().as_uri()}[/green]", soft_wrap=True)
     counts = {s: sum(1 for r in results if r.status is s) for s in Status}
     err.print(
@@ -202,6 +253,27 @@ def atlas(
         f"UNKNOWN {counts[Status.UNKNOWN]}  PASS {counts[Status.PASS]}[/dim]"
     )
     raise typer.Exit(code=exit_code(results, fail_on))
+
+
+def _progress(name: str, state: str) -> None:
+    err.print(f"[dim]{name}: {state}[/dim]")
+
+
+def _score_cluster(
+    client: httpx.Client,
+    project_id: str,
+    name: str,
+    project: ProjectFacts,
+    window: SlowQueryWindow | None,
+    policy: Policy,
+    attestations: Attestations,
+    policy_file: Path | None,
+    attest_file: Path | None,
+) -> ClusterReport:
+    err.print(f"[bold]{name}[/bold]")
+    facts = collect_cluster(client, project_id, name, project, _progress, slow_query_window=window)
+    results = apply_attestations(evaluate(facts, policy), attestations)
+    return ClusterReport(scope=_scope(facts, policy, policy_file, attest_file), results=results)
 
 
 @app.command()
