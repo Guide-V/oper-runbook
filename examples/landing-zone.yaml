@@ -1,0 +1,100 @@
+# mongoops waf-check landing-zone policy
+# Baseline: MongoDB Atlas operational-readiness checklist and Architecture Center defaults.
+# Edit what differs for your landing zone; delete nothing you do not care about, defaults apply.
+# One file per environment is the intended pattern (e.g. landing-zone.prod.yaml).
+profile: mongodb-defaults
+
+network:
+  # private_endpoint: cluster must have a private endpoint attached
+  # peering:          private endpoint or VPC/VNet peering is acceptable
+  # ip_allowlist:     public access list only (0.0.0.0/0 is still a failure)
+  mode: private_endpoint
+  # access list entries broader than this prefix length are reported (24 = /24)
+  min_cidr_prefix: 24
+
+tls:
+  minimum: TLS1_2          # TLS1_2 or TLS1_3
+
+auth:
+  # Atlas does not rotate database passwords; false means SCRAM users are reported.
+  allow_password_users: false
+
+encryption:
+  # BYOK via AWS KMS / Azure Key Vault / GCP KMS
+  require_customer_managed_keys: true
+
+ha:
+  min_electable_nodes: 3
+  min_regions: 1            # 2+ for multi-region resilience
+
+backup:
+  restore_window_days: 7   # point-in-time window, from RPO
+  required_frequencies: [daily, weekly, monthly]
+  require_snapshot_copy: false   # copies to another region
+  # Backup Compliance Policy (irreversible once enabled)
+  require_compliance_policy: false
+
+cluster:
+  min_mongodb_major: "7.0"
+
+tags:
+  required: [application, environment, contact, criticality]
+
+alerts:
+  # EVENT or EVENT/METRIC as shown in the Atlas alert configuration
+  required:
+    - OUTSIDE_METRIC_THRESHOLD/CONNECTIONS_PERCENT
+    - OUTSIDE_METRIC_THRESHOLD/NORMALIZED_SYSTEM_CPU_USER
+    - OUTSIDE_METRIC_THRESHOLD/DISK_PARTITION_SPACE_USED_DATA
+    - OUTSIDE_METRIC_THRESHOLD/DISK_PARTITION_IOPS_TOTAL_DATA
+    - OUTSIDE_METRIC_THRESHOLD/QUERY_TARGETING_SCANNED_OBJECTS_PER_RETURNED
+    - OUTSIDE_METRIC_THRESHOLD/OPLOG_SLAVE_LAG_MASTER_TIME
+    - REPLICATION_OPLOG_WINDOW_RUNNING_OUT
+    - NO_PRIMARY
+    - HOST_DOWN
+
+integrations:
+  # e.g. [DATADOG, PROMETHEUS, PAGER_DUTY]; empty list = not checked
+  required: []
+
+performance:
+  require_compute_autoscaling: true
+  require_disk_autoscaling: true
+  max_suggested_indexes: 0
+  require_default_max_time_ms: false
+
+cost:
+  max_snapshot_retention_days: 365
+
+# Severity of every automatic check when it does not pass: fail, warn or off
+# (write "off" with quotes if your YAML tooling complains; bare off is accepted too).
+checks:
+  sec.network.no-open-access: fail
+  sec.network.private-connectivity: warn
+  sec.network.access-list-scoped: warn
+  sec.tls.minimum-version: fail
+  sec.auth.no-password-users: warn
+  sec.encryption.customer-managed-keys: warn
+  sec.audit.enabled: fail
+  sec.hardening.server-side-javascript-disabled: warn
+  rel.ha.electable-nodes: fail
+  rel.ha.regions: warn
+  rel.protection.termination-protection: fail
+  rel.backup.enabled: fail
+  rel.backup.continuous: fail
+  rel.backup.restore-window: warn
+  rel.backup.schedule: warn
+  rel.backup.snapshot-copy: warn
+  rel.backup.compliance-policy: warn
+  rel.maintenance.window: warn
+  rel.maintenance.protected-hours: warn
+  rel.version.minimum: warn
+  ops.tags.required: warn
+  ops.alerts.recommended: warn
+  ops.integrations.observability: warn
+  ops.project.advisors-enabled: warn
+  perf.autoscaling.compute: warn
+  perf.autoscaling.disk: warn
+  perf.advisor.suggested-indexes: warn
+  perf.config.default-max-time-ms: warn
+  cost.backup.retention: warn

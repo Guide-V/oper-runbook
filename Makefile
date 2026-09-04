@@ -19,7 +19,7 @@ LATEST = $(REPORT_DIR)/$@-latest.html
 link_latest = ln -sf "$(notdir $(REPORT))" "$(LATEST)"
 
 .PHONY: venv install test test-integration test-atlas-local test-atlas-live lint typecheck check \
-        probe-atlas probe-local atlas-local-up atlas-local-seed atlas-local-down
+        probe-atlas probe-local probe-waf atlas-local-up atlas-local-seed atlas-local-down
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -66,6 +66,15 @@ probe-atlas:
 probe-local:
 	$(BIN)/mongoops regex-finder live --uri "$(LOCAL_URI)" $(NS_FLAG) --view $(VIEW) \
 	  --html "$(REPORT)" $(ARGS)
+	@$(link_latest)
+
+# WAF readiness scorecard for one cluster (read-only Admin API calls).
+#   make probe-waf ATLAS_CLUSTER=Cluster0
+#   make probe-waf ATLAS_CLUSTER=Cluster0 POLICY=landing-zone.prod.yaml ARGS="--fail-on fail"
+POLICY ?=
+POLICY_FLAG = $(if $(POLICY),--policy "$(POLICY)",)
+probe-waf:
+	$(BIN)/mongoops waf-check atlas -c "$(ATLAS_CLUSTER)" $(POLICY_FLAG) --html "$(REPORT)" $(ARGS)
 	@$(link_latest)
 
 lint:

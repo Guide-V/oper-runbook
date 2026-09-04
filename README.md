@@ -7,6 +7,7 @@ entry point, `mongoops`, and one sub-command per script.
 | Script | Command | What it does |
 | --- | --- | --- |
 | regex-finder | `mongoops regex-finder ...` | Finds `$regex` usage in slow queries reported by Performance Advisor (Atlas or Ops Manager) or found in mongod logs, and classifies each regex for index-friendliness. |
+| waf-check | `mongoops waf-check ...` | Scores one Atlas cluster against the [operational-readiness checklist](https://www.mongodb.com/docs/atlas/architecture/current/operational-readiness-checklist/) and the five Well-Architected pillars, using read-only Admin API facts and a landing-zone policy you own. Atlas only. |
 
 ## Requirements
 
@@ -14,6 +15,8 @@ entry point, `mongoops`, and one sub-command per script.
 * For Atlas: a programmatic API key **or** a Service Account with **Project Data Access Read
   Only** (or Project Observability Viewer). Plain Project Read Only can list clusters and
   processes but gets `401 USER_UNAUTHORIZED` on the Performance Advisor endpoint (verified).
+  `waf-check` works with Project Read Only and reports the few checks that need Project Owner
+  as `UNKNOWN` (see its section).
 * For EA: Ops Manager / Cloud Manager API key, or read access to the `mongod.log` files.
 * Optional for local testing: [Atlas CLI](https://www.mongodb.com/docs/atlas/cli/) + Docker
   (for `atlas deployments setup --type local`) and `mongosh`.
@@ -297,6 +300,108 @@ Troubleshooting `atlas`:
 | `MONGODB_OPS_MANAGER_URL`, `MONGODB_OPS_MANAGER_PUBLIC_API_KEY`, `MONGODB_OPS_MANAGER_PRIVATE_API_KEY`, `MONGODB_OPS_MANAGER_PROJECT_ID`, `MONGODB_OPS_MANAGER_CA_FILE` | `ops-manager` |
 | `MONGODB_URI` | default for `live --uri` |
 
+## waf-check
+
+### Why
+
+The Well-Architected enablement session ended with three decisions: use MongoDB's
+operational-readiness checklist as the baseline, derive an organisation-specific checklist from
+the landing zone, and treat Performance Advisor as a CI/CD quality gate. `waf-check` turns the
+first two into a repeatable, read-only report: it reads the cluster and project configuration
+through the Atlas Admin API, compares it with a policy file, and produces a pillar scorecard with
+the evidence and the Atlas fix for every gap. Items the API cannot see (DR drills, training,
+CSFLE design, org structure) are listed under "Discuss these" instead of being faked as green.
+
+### Quick start
+
+```bash
+# 1. Score a cluster with MongoDB's defaults (needs MONGODB_ATLAS_* in .env, see below)
+mongoops waf-check atlas -c <ClusterName> --html reports/waf.html
+open reports/waf.html
+
+# 2. Write a landing-zone policy, answer a few questions, then score against it
+mongoops waf-check init -i -o landing-zone.prod.yaml
+mongoops waf-check atlas -c <ClusterName> --policy landing-zone.prod.yaml -f json -o reports/waf.json
+
+# 3. See every check id and its default severity (the keys of the policy's `checks:` section)
+mongoops waf-check checks
+```
+
+`make probe-waf ATLAS_CLUSTER=<name> [POLICY=file]` does step 1 and drops the HTML in `reports/`.
+
+### How a check is scored
+
+Three layers, so the official checklist and the customer's landing zone stay separate:
+
+| Layer | Lives in | Role |
+| --- | --- | --- |
+| Catalog | `waf_check/catalog.py` | Stable check ids mapped to the checklist, pillar, default severity, docs link. |
+| Facts | `waf_check/facts.py` | Raw Admin API documents for the cluster and its project, fetched one by one. |
+| Policy | `landing-zone.yaml` (from `waf-check init`) | What "good" means here: network mode, RPO window, required tags and alerts, and the severity (`fail` / `warn` / `off`) of every check. |
+
+Every auto check ends in one status:
+
+| Status | Meaning |
+| --- | --- |
+| `FAIL` / `WARN` | Does not meet the policy; the severity comes from the policy file (`checks:` section). |
+| `PASS` | Meets the policy. |
+| `UNKNOWN` | The API key could not read the fact (role) or the API errored. Never counted as a failure; the message names the role needed. |
+| `NA` | Not applicable: shared/Flex tier, a prerequisite failed already (backups off makes the PIT window moot), or the policy says the control is not required. The message says which. |
+| `SKIPPED` | Severity `off` in the policy. |
+| `DISCUSS` | People/process item for the workshop. |
+
+Default severities follow one rule: `fail` when the gap can lose data or expose the cluster
+(0.0.0.0/0, TLS below 1.2, fewer than 3 electable nodes, no termination protection, backups or
+point-in-time restore off, auditing off), `warn` for governance and recommendations a landing
+zone may legitimately decide differently (tags, alerts, autoscaling, BYOK, snapshot copies,
+maintenance window, password users). Change any of them in `checks:`.
+
+### What is checked
+
+29 automatic checks and 17 discussion items; `mongoops waf-check checks` prints the full list.
+Highlights per pillar, with the Admin API evidence:
+
+* **Security**: no `0.0.0.0/0` and no CIDR wider than the policy floor in the access list;
+  private endpoint (or peering, per `network.mode`) attached to the cluster; minimum TLS;
+  no SCRAM users in scope of the cluster (Atlas cannot rotate passwords, the session's point);
+  customer-managed keys; auditing enabled; server-side JavaScript off.
+* **Reliability**: electable nodes per shard, regions, termination protection, Cloud Backup,
+  continuous backup, restore window vs RPO, snapshot frequencies, snapshot copy, Backup
+  Compliance Policy, maintenance window and protected hours, MongoDB version floor.
+* **Operational efficiency**: required tags (`application`, `environment`, `contact`,
+  `criticality` by default), recommended alerts present and enabled, observability integration
+  (Datadog, Prometheus, ...) when the policy names one, advisors enabled on the project.
+* **Performance**: compute and storage autoscaling, outstanding Performance Advisor index
+  suggestions, cluster-level `defaultMaxTimeMS` when the policy asks for it.
+* **Cost**: longest snapshot retention vs the policy ceiling.
+* **Discuss**: org/project layout, Terraform ownership, roles and change control, support and
+  training, developer access, federated auth roll-out, CSFLE/Queryable Encryption and the
+  driver-only export path, CA pinning, compliance standards, RPO/RTO, DR runbook and restore
+  drill, failover testing with retryable writes, schema/index review cadence, read locality
+  and sharding, idle clusters, data lifecycle (TTL / Online Archive), billing by tag.
+
+### Roles the key needs
+
+| Endpoint | Role | If missing |
+| --- | --- | --- |
+| Cluster, processArgs, backup schedule, access list, peers, maintenance window, alert configs, database users, project settings | Project Read Only | (baseline) |
+| `auditLog`, `integrations`, `backupCompliancePolicy` | Project Owner | `sec.audit.enabled`, `ops.integrations.observability`, `rel.backup.compliance-policy` -> `UNKNOWN` |
+| `performanceAdvisor/suggestedIndexes` | Project Data Access Read Only | `perf.advisor.suggested-indexes` -> `UNKNOWN` |
+
+A read-only key is enough for a first report; the HTML lists what it could not read.
+
+### Output and gating
+
+`-f table|json|html`, `-o FILE`, `--html FILE` (always in addition). The JSON has
+`summary.by_status`, `summary.by_pillar`, `checks[]` (id, status, severity, evidence, remedy,
+doc) and `discuss[]`. `--fail-on fail` exits 1 on any `FAIL`; `--fail-on warn` also on `WARN`;
+default `never` (exit 0, findings or not, 2 on usage or API errors). `UNKNOWN` never trips
+the gate.
+
+Scope in this version is one cluster plus the project settings it inherits (access list,
+audit, alerts, maintenance window). Project-level facts are fetched once per run, so scoring a
+whole project later is a loop over clusters, not a redesign.
+
 ## Running it from Ansible or a CI/CD pipeline
 
 Guidelines only; nothing in the repo assumes a particular automation tool. The properties that
@@ -520,6 +625,16 @@ src/mongoops/
     atlas_api.py             Atlas Admin API v2 client (digest or service account)
     ops_manager_api.py       Ops Manager / Cloud Manager API client (digest)
     timeutil.py              --since / --duration parsing
+    html_theme.py            CSS + table filter/sort script shared by every HTML report
+  waf_check/
+    model.py                 Pillar / Kind / Severity / Status, CheckSpec, Outcome -> CheckResult
+    catalog.py               check ids mapped to the operational-readiness checklist (+ discuss items)
+    policy.py                landing-zone policy: defaults, YAML load/validate, commented writer
+    facts.py                 Atlas Admin API collectors; 401/403 -> Fact(error) not failure
+    checks.py                pure evaluators, one per auto check
+    report.py                table / json rendering, Scope, sorting and counts
+    html_report.py           self-contained HTML scorecard
+    cli.py                   typer sub-commands: atlas, init, checks
   regex_finder/
     detector.py              pure regex detection + index-friendliness classification
     analyze.py               SlowQuery x RegexUsage -> Finding, filters
@@ -530,6 +645,7 @@ src/mongoops/
     sources.py               I/O adapters: atlas, ops-manager, logfile, live
     cli.py                   typer sub-commands
 tests/                       unit tests (default) and tests/integration (opt-in, -m integration)
+examples/landing-zone.yaml   the policy `waf-check init` writes (a test keeps it in sync)
 scripts/dev/                 seed workloads (atlas-local and real Atlas)
 spec.md                      decision log
 ```

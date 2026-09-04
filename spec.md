@@ -233,3 +233,108 @@ say which regexes are index-hostile.
     slow-query fixture was normalised with the same substitution, which is safe because the
     tests assert on the same namespace. History was squashed to a single commit so that no
     earlier revision carries customer-specific names.
+
+## 2026-09-04: `waf-check`, the Well-Architected readiness scorecard
+
+### Goal
+
+After the Well-Architected enablement session the group decided to (a) use MongoDB's
+operational-readiness checklist as the baseline, (b) derive an organisation-specific checklist
+from their landing zone, and (c) treat Performance Advisor as a CI/CD gate. `waf-check` turns
+(a) and (b) into a read-only report that can be re-run after every change; (c) is already the
+regex-finder README section and will be composed in later.
+
+### Decisions
+
+21. **Second sub-command, not an extension of regex-finder.** Different question ("is this
+    landing zone well-architected?" vs "are these queries index-hostile?"), different cadence
+    (workshop/weekly vs post-deploy), different scope (cluster + project settings vs namespace +
+    time window). They share `common/` (auth, API client) and now `common/html_theme.py`.
+
+22. **Three layers: catalog, facts, policy.** The official checklist is guidance; the landing
+    zone is policy. Hard-coding "Private Endpoint required" or "7-day PIT" as universal truth
+    would make the report wrong for any customer whose landing zone decided otherwise. So:
+    `catalog.py` holds stable ids mapped to the checklist with a default severity;
+    `facts.py` fetches raw Admin API documents; `policy.py` holds MongoDB's defaults and merges
+    the customer YAML on top; `checks.py` is pure `Facts x Policy -> Outcome`.
+
+23. **Cluster scope first, project facts fetched once.** Requested by the customer. Several
+    checks are inherently project-level (access list, audit, alerts, maintenance window,
+    integrations); the report states that the cluster "inherits" them. Extending to a whole
+    project is a loop over clusters reusing the project facts; nothing in the model assumes
+    one cluster.
+
+24. **MongoDB defaults as the starting policy, `init` writes them out.** The customer's landing
+    zone is not written yet, so the first report runs on the Architecture Center defaults and
+    the report itself becomes the input to the landing-zone workshop. `waf-check init -i` asks
+    the ten questions that change what the checks expect (network mode, BYOK, SCRAM users,
+    electable nodes, regions, restore window, snapshot copy, tags, integrations, autoscaling)
+    with plain `typer` prompts.
+    *Pushback recorded*: a TUI/GUI onboarding was suggested. Declined for v1 because the
+    artefact that matters is the YAML (diffable, reviewable, one per environment, usable in
+    CI); a TUI adds a dependency and a second code path for the same ten values. If the
+    workshop format needs it later, the prompt list is the spec for it.
+
+25. **Per-check severity `fail` / `warn` / `off`, plus values.** Requested by the customer.
+    Severity alone is not enough: "private endpoint" vs "peering acceptable", or RPO 7 vs 14
+    days, are values, not severities. So the policy has both a `checks:` map (severity) and
+    typed sections (values). Policy-off-by-value yields `NA` with the reason ("policy
+    backup.require_snapshot_copy is false") so a reader sees why nothing was evaluated.
+    Bare `off` in YAML 1.1 parses as boolean false; the loader accepts that, caught by a test.
+
+26. **`UNKNOWN` is a first-class status and never a failure.** Verified against the API docs
+    and live: `auditLog`, `integrations` and `backupCompliancePolicy` need Project Owner,
+    `suggestedIndexes` needs Project Data Access Read Only; a Project Read Only key gets 401.
+    Each fact is fetched on its own and wrapped in `Fact(value | error)`; the UNKNOWN message
+    names the role. Without this, a read-only key would produce false FAILs on the most
+    sensitive checks and the report would not be trusted.
+
+27. **Default severity rule.** `fail` when the gap can lose data or expose the cluster
+    (0.0.0.0/0, TLS < 1.2, < 3 electable nodes, no termination protection, backup or PIT off,
+    audit off); `warn` for governance and recommendations (tags, alerts, autoscaling, BYOK,
+    snapshot copies, maintenance window, password users). Written down so the customer can
+    argue with a rule rather than with 29 individual choices.
+
+28. **No composite 0-100 score.** Counts per status and per pillar, worst-first ordering, and
+    the gate on `FAIL` (or `WARN`). A single number invites gaming and hides that one open
+    access list entry matters more than five missing tags.
+
+29. **Process items are `DISCUSS`, never auto-green.** Seventeen items from the checklist and
+    the session (DR drill, RPO/RTO, CSFLE and the driver-only export path, CA pinning,
+    Terraform ownership, CoE, training, data lifecycle ...) are rendered in a "Discuss these"
+    section of the HTML and a `discuss[]` array in JSON. Requested as v1 behaviour; a sign-off
+    file with owner and date is the natural v2.
+
+30. **Atlas only.** Requested. The model (`CheckSpec`, `Outcome`, `Facts`) is product-neutral
+    so an Ops Manager collector can be added, but no EA code was written speculatively.
+
+31. **Live verification on `cluster-free` (M20, Azure, MongoDB 9.0) with the Project Read Only
+    + Data Access key**: 3 FAIL (0.0.0.0/0, no termination protection, backups off), 7 WARN,
+    1 UNKNOWN (audit), 10 PASS, 8 NA. The recommended-alert check reported 3 of 9 missing; a
+    dump of the project's 63 alert configurations confirmed the six present ones are Atlas
+    defaults and the three missing (disk IOPS, replication lag, host down) are Architecture
+    Center recommendations that Atlas does not create by default, so the default list is
+    producing real findings, not naming mismatches. Rendered with headless Chrome.
+
+32. **`Accept: application/vnd.atlas.2024-08-05+json` for cluster, processArgs and backup
+    schedule.** Those resources deprecate the 2023-01-01 version the regex-finder client uses
+    for its endpoints; the shared client keeps its default and `facts.py` overrides per request.
+
+33. **One HTML theme, MongoDB green and white.** `common/html_theme.py` now owns the CSS and the
+    table filter/sort script for both dashboards (the regex one imported its private copy
+    before). Palette: Evergreen `#023430` header and dark text, Forest Green `#00684A` for
+    headings, chips and PASS, Spring Green `#00ED64` accents, Mist `#E3FCF7` table heads, white
+    page. The former navy header and blue "index"/UNKNOWN badges were replaced with greens. Red
+    and amber stay for FAIL/WARN only, as status semantics rather than chrome. Verified with
+    headless Chrome on both the live WAF scorecard and the fixture regex dashboard.
+
+### Known limitations / follow-ups
+
+* Compose regex-finder (and later suggested-index details) into the Performance pillar so one
+  run produces both reports; add `--fail-on` to regex-finder for parity.
+* Project scope: `waf-check atlas --all-clusters`, reusing project facts.
+* Attestation file for `DISCUSS` items (owner, date, note) so the workshop output is recorded.
+* Idle-cluster cost check needs process measurements (connections over 7 days); deferred.
+* Alert metric names are matched exactly; if Atlas renames one, the default list shows it as
+  missing. The policy file is the fix, and the evidence names the exact string.
+* Peering is looked up for the cluster's provider only (multi-cloud clusters: first provider).

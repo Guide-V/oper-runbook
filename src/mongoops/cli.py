@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 from mongoops import __version__
 from mongoops.regex_finder.cli import app as regex_finder_app
+from mongoops.waf_check.cli import app as waf_check_app
 
 app = typer.Typer(
     name="mongoops",
@@ -14,6 +15,7 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 app.add_typer(regex_finder_app, name="regex-finder")
+app.add_typer(waf_check_app, name="waf-check")
 
 
 @app.callback(invoke_without_command=True)
