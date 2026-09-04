@@ -1,0 +1,56 @@
+[project]
+name = "mongoops"
+version = "0.1.0"
+description = "Operational scripts for the MongoDB operations team (Atlas and Enterprise Advanced)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+  "httpx>=0.28",
+  "pymongo>=4.13",
+  "typer>=0.16",
+  "rich>=14",
+  "python-dotenv>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4",
+  "pytest-cov>=6",
+  "ruff>=0.12",
+  "mypy>=1.17",
+]
+
+[project.scripts]
+mongoops = "mongoops.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mongoops"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: needs a live MongoDB (set MONGOOPS_TEST_MONGODB_URI); skipped otherwise",
+  "atlas_live: needs a seeded Atlas cluster (set MONGOOPS_TEST_ATLAS_CLUSTER); skipped otherwise",
+]
+addopts = "-m 'not integration and not atlas_live'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]  # long literal log lines / fixtures
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
