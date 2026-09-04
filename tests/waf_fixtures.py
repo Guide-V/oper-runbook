@@ -224,5 +224,45 @@ def bad_facts() -> Facts:
         integrations=Fact(()),
         database_users=Fact(USERS_MIXED),
         project_settings=Fact({**SETTINGS_ON, "isSchemaAdvisorEnabled": False}),
-        suggested_indexes=Fact({"suggestedIndexes": [{"namespace": "shop.orders"}]}),
+        suggested_indexes=Fact(SUGGESTED_INDEXES),
     )
+
+
+# Shape of GET /clusters/{name}/performanceAdvisor/suggestedIndexes (2024-08-05).
+SUGGESTED_INDEXES: dict[str, Any] = {
+    "shapes": [
+        {
+            "id": "shape-1",
+            "namespace": "shop.orders",
+            "avgMs": 250,
+            "count": 340,
+            "inefficiencyScore": 12000,
+            "operations": [],
+        },
+        {
+            "id": "shape-2",
+            "namespace": "shop.orders",
+            "avgMs": 90,
+            "count": 20,
+            "inefficiencyScore": 800,
+            "operations": [],
+        },
+        {"id": "shape-3", "namespace": "shop.events", "avgMs": 40, "count": 5},
+    ],
+    "suggestedIndexes": [
+        {
+            "id": "idx-a",
+            "namespace": "shop.events",
+            "index": [{"ts": -1}],
+            "weight": 1.5,
+            "impact": ["shape-3"],
+        },
+        {
+            "id": "idx-b",
+            "namespace": "shop.orders",
+            "index": [{"sku": 1}, {"ts": -1}],
+            "weight": 12.34,
+            "impact": ["shape-1", "shape-2", "shape-gone"],
+        },
+    ],
+}

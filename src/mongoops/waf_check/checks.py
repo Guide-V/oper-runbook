@@ -582,16 +582,61 @@ def suggested_indexes(facts: Facts, policy: Policy) -> Outcome:
         return na
     if not facts.suggested_indexes.available:
         return _unavailable(facts.suggested_indexes)
-    body = facts.suggested_indexes.value or {}
-    suggestions = tuple(body.get("suggestedIndexes") or [])
-    namespaces = tuple(sorted({str(s.get("namespace", "")) for s in suggestions}))
+    suggestions = index_suggestions(facts.suggested_indexes.value or {})
+    namespaces = tuple(sorted({s["namespace"] for s in suggestions}))
+    shown = "; ".join(_describe_suggestion(s) for s in suggestions[:3])
+    more = f"; +{len(suggestions) - 3} more" if len(suggestions) > 3 else ""
     return Outcome(
         ok=len(suggestions) <= policy.performance_max_suggested_indexes,
-        message=f"{len(suggestions)} suggested index(es)",
-        evidence={"count": len(suggestions), "namespaces": namespaces},
+        message=f"{len(suggestions)} suggested index(es)" + (f": {shown}{more}" if shown else ""),
+        evidence={
+            "count": len(suggestions),
+            "namespaces": namespaces,
+            "suggestions": suggestions,
+        },
         remedy="Review the suggestions in Performance Advisor and create the indexes through the "
         "release process (or record why not).",
     )
+
+
+def index_suggestions(body: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Flatten ``suggestedIndexes[]`` and join the ``shapes[]`` they impact, heaviest first.
+
+    Atlas returns the index keys as ``[{field: 1}, ...]`` and the impact as shape ids; the
+    report wants one line per suggestion: namespace, key pattern, weight, and how many slow
+    queries (and how slow) it would help. Pure.
+    """
+    shapes = {str(s.get("id")): s for s in body.get("shapes") or [] if isinstance(s, Mapping)}
+    rows = []
+    for s in body.get("suggestedIndexes") or []:
+        if not isinstance(s, Mapping):
+            continue
+        impacted = tuple(shapes[i] for i in s.get("impact") or [] if str(i) in shapes)
+        rows.append(
+            {
+                "namespace": str(s.get("namespace", "")),
+                "index": _index_keys(s.get("index") or []),
+                "weight": round(float(s.get("weight") or 0), 1),
+                "slow_queries": sum(int(sh.get("count") or 0) for sh in impacted),
+                "avg_ms": max((int(sh.get("avgMs") or 0) for sh in impacted), default=0),
+                "inefficiency": max(
+                    (int(sh.get("inefficiencyScore") or 0) for sh in impacted), default=0
+                ),
+            }
+        )
+    return tuple(sorted(rows, key=lambda r: (-r["weight"], -r["slow_queries"], r["namespace"])))
+
+
+def _index_keys(index: Sequence[Any]) -> str:
+    keys = ", ".join(
+        f"{k}: {v}" for part in index if isinstance(part, Mapping) for k, v in part.items()
+    )
+    return "{" + keys + "}"
+
+
+def _describe_suggestion(s: Mapping[str, Any]) -> str:
+    usage = f", {s['slow_queries']} slow queries avg {s['avg_ms']} ms" if s["slow_queries"] else ""
+    return f"{s['namespace']} {s['index']} (weight {s['weight']}{usage})"
 
 
 def regex_index_hostile(facts: Facts, policy: Policy) -> Outcome:

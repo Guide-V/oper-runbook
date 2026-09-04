@@ -99,6 +99,21 @@ class TestEvaluate:
             "contact",
             "criticality",
         )
+        # suggested indexes: heaviest first, shapes joined, unknown shape ids ignored
+        advisor = results["perf.advisor.suggested-indexes"]
+        assert advisor.evidence["count"] == 2
+        assert advisor.evidence["suggestions"][0] == {
+            "namespace": "shop.orders",
+            "index": "{sku: 1, ts: -1}",
+            "weight": 12.3,
+            "slow_queries": 360,
+            "avg_ms": 250,
+            "inefficiency": 12000,
+        }
+        assert advisor.message.startswith(
+            "2 suggested index(es): shop.orders {sku: 1, ts: -1} (weight 12.3, 360 slow queries "
+            "avg 250 ms); shop.events {ts: -1} (weight 1.5, 5 slow queries avg 40 ms)"
+        )
         assert (
             results["ops.alerts.recommended"]
             .evidence["missing"][0]
