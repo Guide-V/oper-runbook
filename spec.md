@@ -350,12 +350,57 @@ regex-finder README section and will be composed in later.
       the collector can name the failing endpoint and reuse the host matching without touching
       private helpers.
 
+35. **Suggested-index details instead of a count.** `perf.advisor.suggested-indexes` joins
+    `suggestedIndexes[]` with the `shapes[]` each one impacts (namespace, key pattern, weight,
+    slow queries helped, their average latency), heaviest first. The message names the top
+    three, the evidence carries all of them, so the platform team can create the index from the
+    report without opening Performance Advisor. Unknown shape ids in `impact` are ignored rather
+    than failing the check: the two arrays are sampled at slightly different times.
+
+36. **Attestations: the discussion items get a file, not a checkbox.** The workshop settles
+    the people/process items; without a record they stay "to discuss" forever, and with a bare
+    "done" flag nobody knows who decided what or when. `waf-check attest-init` writes every
+    discuss id with `status: open`; the team fills in `status` (`pass` / `fail` / `warn` /
+    `na`), `owner`, `date`, `note` and passes the file with `--attest`.
+    * An attested item takes the recorded status. It is still `kind: discuss`, so renderers
+      keep it in the discussion section (with a badge) and in `discuss[]`, but it now counts in
+      the pillar totals, appears under "Action needed" when `fail` / `warn`, and trips
+      `--fail-on`. A recorded gap is a real finding; a recorded pass is real credit.
+    * Attestations expire: older than `valid_days` (default 365) falls back to `DISCUSS` with
+      the old answer in the message. Yearly re-confirmation is the point of the exercise, and
+      an evergreen "pass" from 2024 would defeat it.
+    * Validation mirrors the policy loader: unknown ids, auto-check ids, bad statuses, missing
+      owner or date are errors that name the key. `open` entries need nothing else, so the
+      template loads as written. `examples/attestations.yaml` is kept in sync by a test.
+    * Rejected: putting attestations inside `landing-zone.yaml`. The policy is "what good
+      means" and changes rarely; attestations are "what we found and decided" and change per
+      review. Different owners, different cadence, different file.
+
+37. **`--all-clusters`: project scope as a loop, as promised in decision 23.** `collect_atlas`
+    is split into `collect_project` (8 project facts, fetched once) and `collect_cluster`
+    (cluster resource, `processArgs`, backup schedule, peers for the cluster's provider,
+    Performance Advisor). `--all-clusters` lists the project's clusters and scores each against
+    the same policy and attestations.
+    * Report shape: roll-up first (FAIL / WARN / UNKNOWN / PASS per cluster, sortable in HTML),
+      then action items across clusters worst first with the cluster named on each card, then
+      one section per cluster (pillars, unknowns, all checks), then the discussion items once.
+      Discussion items are project-level, so `project_results` counts them once; the gate sees
+      the union of every cluster's auto results plus those.
+    * JSON nests one per-cluster payload (same shape as the single-cluster JSON minus
+      `discuss`) under `clusters[]`, with `summary.by_cluster` on top, so a consumer of the
+      single-cluster format can index into a project run without a second schema.
+    * `-c` and `--all-clusters` are mutually exclusive (exit 2). A cluster that is listed but
+      unreadable fails the run rather than being skipped: that is an anomaly worth seeing.
+    * Verified live on project `67da6e57...` (2 clusters, read-only key): project facts fetched
+      once, 5 FAIL / 18 WARN / 3 UNKNOWN / 20 PASS across `Cluster0` and `cluster-free`; the
+      shared `0.0.0.0/0` entry shows on both clusters, as it should, since it is one access list.
+
 ### Known limitations / follow-ups
 
-* Suggested-index details (namespace, weight) could join the Performance pillar the same way.
-* Project scope: `waf-check atlas --all-clusters`, reusing project facts.
-* Attestation file for `DISCUSS` items (owner, date, note) so the workshop output is recorded.
 * Idle-cluster cost check needs process measurements (connections over 7 days); deferred.
+* Attestations are per project in practice but the file is not tied to a project id; a team
+  with several projects keeps several files (or one with a superset), passed explicitly.
+* Scoring a large project is sequential: roughly 5 requests per cluster after the shared 8.
 * Alert metric names are matched exactly; if Atlas renames one, the default list shows it as
   missing. The policy file is the fix, and the evidence names the exact string.
 * Peering is looked up for the cluster's provider only (multi-cloud clusters: first provider).

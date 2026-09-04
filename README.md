@@ -326,11 +326,20 @@ mongoops waf-check atlas -c <ClusterName> --policy landing-zone.prod.yaml -f jso
 # 3. Add the regex-finder scan of the last day's slow queries (Performance pillar) and gate
 mongoops waf-check atlas -c <ClusterName> --slow-queries-since 24h --fail-on warn
 
-# 4. See every check id and its default severity (the keys of the policy's `checks:` section)
+# 4. Record the workshop's answers to the "discuss these" items and score with them
+mongoops waf-check attest-init -o attestations.yaml        # every item, status: open
+mongoops waf-check atlas -c <ClusterName> --attest attestations.yaml
+
+# 5. Whole project: one page, project facts fetched once, roll-up per cluster
+mongoops waf-check atlas --all-clusters --policy landing-zone.prod.yaml --attest attestations.yaml \
+  --html reports/waf-project.html
+
+# 6. See every check id and its default severity (the keys of the policy's `checks:` section)
 mongoops waf-check checks
 ```
 
-`make probe-waf ATLAS_CLUSTER=<name> [POLICY=file]` does step 1 and drops the HTML in `reports/`.
+`make probe-waf ATLAS_CLUSTER=<name> [POLICY=file] [ATTEST=file]` does step 1 and drops the HTML
+in `reports/`; `make probe-waf-project` does step 5.
 
 ### How a check is scored
 
@@ -341,6 +350,7 @@ Three layers, so the official checklist and the customer's landing zone stay sep
 | Catalog | `waf_check/catalog.py` | Stable check ids mapped to the checklist, pillar, default severity, docs link. |
 | Facts | `waf_check/facts.py` | Raw Admin API documents for the cluster and its project, fetched one by one. |
 | Policy | `landing-zone.yaml` (from `waf-check init`) | What "good" means here: network mode, RPO window, required tags and alerts, and the severity (`fail` / `warn` / `off`) of every check. |
+| Attestations | `attestations.yaml` (from `waf-check attest-init`) | The recorded outcome of each discussion item: `status` (`open` / `pass` / `fail` / `warn` / `na`), `owner`, `date`, `note`. |
 
 Every auto check ends in one status:
 
@@ -351,7 +361,13 @@ Every auto check ends in one status:
 | `UNKNOWN` | The API key could not read the fact (role) or the API errored. Never counted as a failure; the message names the role needed. |
 | `NA` | Not applicable: shared/Flex tier, a prerequisite failed already (backups off makes the PIT window moot), or the policy says the control is not required. The message says which. |
 | `SKIPPED` | Severity `off` in the policy. |
-| `DISCUSS` | People/process item for the workshop. |
+| `DISCUSS` | People/process item for the workshop, not yet attested (or its attestation expired). |
+
+Discussion items are never auto-green. Once the workshop settles one, record it in the
+attestation file: the item takes the recorded status (with owner, date and note as evidence),
+counts in the pillar totals, shows under "Action needed" if it is `fail` / `warn`, and trips
+`--fail-on` like any auto check. Attestations expire after `valid_days` (default 365) and fall
+back to `DISCUSS` with the old answer shown, so the yearly re-confirmation is built in.
 
 Default severities follow one rule: `fail` when the gap can lose data or expose the cluster
 (0.0.0.0/0, TLS below 1.2, fewer than 3 electable nodes, no termination protection, backups or
@@ -375,7 +391,8 @@ Highlights per pillar, with the Admin API evidence:
   `criticality` by default), recommended alerts present and enabled, observability integration
   (Datadog, Prometheus, ...) when the policy names one, advisors enabled on the project.
 * **Performance**: compute and storage autoscaling, outstanding Performance Advisor index
-  suggestions, cluster-level `defaultMaxTimeMS` when the policy asks for it, and (with
+  suggestions (namespace, key pattern, weight, slow queries helped and their average latency,
+  heaviest first), cluster-level `defaultMaxTimeMS` when the policy asks for it, and (with
   `--slow-queries-since 24h`) the regex-finder scan of Performance Advisor slow queries as
   `perf.regex.index-hostile`: shapes whose remedy is in `performance.regex_block_on`
   (`search`, `fix_filter`, `btree_index` by default) make it WARN. Without the flag it is `NA`;
@@ -405,9 +422,12 @@ doc) and `discuss[]`. `--fail-on fail` exits 1 on any `FAIL`; `--fail-on warn` a
 default `never` (exit 0, findings or not, 2 on usage or API errors). `UNKNOWN` never trips
 the gate.
 
-Scope in this version is one cluster plus the project settings it inherits (access list,
-audit, alerts, maintenance window). Project-level facts are fetched once per run, so scoring a
-whole project later is a loop over clusters, not a redesign.
+`-c NAME` scores one cluster plus the project settings it inherits (access list, audit, alerts,
+maintenance window). `--all-clusters` scores every cluster in the project against the same
+policy and attestations, fetching the project facts once: the table and HTML open with a
+roll-up (FAIL / WARN / UNKNOWN / PASS per cluster) and the action items across clusters, then
+one section per cluster, then the discussion items once. The JSON nests one per-cluster payload
+each under `clusters[]` with `summary.by_cluster` on top. `--fail-on` looks at the union.
 
 ## Running it from Ansible or a CI/CD pipeline
 
@@ -642,11 +662,12 @@ src/mongoops/
     model.py                 Pillar / Kind / Severity / Status, CheckSpec, Outcome -> CheckResult
     catalog.py               check ids mapped to the operational-readiness checklist (+ discuss items)
     policy.py                landing-zone policy: defaults, YAML load/validate, commented writer
-    facts.py                 Atlas Admin API collectors; 401/403 -> Fact(error) not failure
+    attest.py                attestations for discuss items: load/validate, apply, expiry, template
+    facts.py                 Atlas Admin API collectors (project once, cluster each); 401/403 -> UNKNOWN
     checks.py                pure evaluators, one per auto check
-    report.py                table / json rendering, Scope, sorting and counts
-    html_report.py           self-contained HTML scorecard
-    cli.py                   typer sub-commands: atlas, init, checks
+    report.py                table / json rendering, Scope, project roll-up, sorting and counts
+    html_report.py           self-contained HTML scorecard (cluster and project pages)
+    cli.py                   typer sub-commands: atlas (-c | --all-clusters), init, attest-init, checks
   regex_finder/
     detector.py              pure regex detection + index-friendliness classification
     analyze.py               SlowQuery x RegexUsage -> Finding, filters
@@ -658,6 +679,7 @@ src/mongoops/
     cli.py                   typer sub-commands
 tests/                       unit tests (default) and tests/integration (opt-in, -m integration)
 examples/landing-zone.yaml   the policy `waf-check init` writes (a test keeps it in sync)
+examples/attestations.yaml   the template `waf-check attest-init` writes (a test keeps it in sync)
 scripts/dev/                 seed workloads (atlas-local and real Atlas)
 spec.md                      decision log
 ```
