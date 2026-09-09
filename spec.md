@@ -295,7 +295,8 @@ regex-finder README section and will be composed in later.
 
 28. **No composite 0-100 score.** Counts per status and per pillar, worst-first ordering, and
     the gate on `FAIL` (or `WARN`). A single number invites gaming and hides that one open
-    access list entry matters more than five missing tags.
+    access list entry matters more than five missing tags. (Revisited in decision 38: a
+    weighted score out of 10 was added on request, with rules that answer both objections.)
 
 29. **Process items are `DISCUSS`, never auto-green.** Seventeen items from the checklist and
     the session (DR drill, RPO/RTO, CSFLE and the driver-only export path, CA pinning,
@@ -394,6 +395,40 @@ regex-finder README section and will be composed in later.
     * Verified live on project `67da6e57...` (2 clusters, read-only key): project facts fetched
       once, 5 FAIL / 18 WARN / 3 UNKNOWN / 20 PASS across `Cluster0` and `cluster-free`; the
       shared `0.0.0.0/0` entry shows on both clusters, as it should, since it is one access list.
+
+38. **A score out of 10, reversing decision 28 with guardrails.** The customer asked for a
+    gamified project score once the report was in use: counts did not compare between clusters
+    with a different number of applicable checks and gave the team nothing to aim for. The
+    objections in decision 28 (gaming, hiding severity) are answered in the rules rather than by
+    refusing the number. `waf_check/score.py` is pure and every digit traces to the checks:
+    * Only evaluated checks count (`PASS`, `WARN`, `FAIL`). `UNKNOWN`, `NA`, `SKIPPED` and open
+      `DISCUSS` stay out of numerator and denominator, so a narrow API key cannot lower the
+      score and switching a check `off` cannot raise it above what the remaining checks earn.
+    * Weight follows the policy severity: a `fail` check is worth 2 points, `warn` 1. Passing
+      earns the weight, failing earns nothing. One `0.0.0.0/0` entry therefore costs twice as
+      much as a missing tag, which is the severity argument from decision 28 encoded in the
+      arithmetic. Attested discussion items count once attested (an attested FAIL weighs 2), so
+      settling the workshop items moves the score too.
+    * `score = 10 x earned / possible`, one decimal; tiers on the rounded value: Well-architected
+      9.0+, Ready with gaps 7.0+, Needs work 5.0+, At risk below. Project score pools every
+      cluster's points rather than averaging cluster scores, so a cluster with more applicable
+      checks weighs more, and the discussion items count once.
+    * Gamification follows the gamified-calculator-ui rules: deterministic, the arithmetic is
+      printed next to the number, improvement is what gets celebrated (quick wins with the
+      points each fix adds, grouped by check id so a project-wide setting failing on every
+      cluster shows once with the combined gain; "N fixes away from the next tier" computed
+      greedily by weight), the ring/count-up is a reveal only (final value is in the markup,
+      `prefers-reduced-motion` skips it). The score is presentation: `--fail-on` still gates on
+      statuses and no evaluator changed.
+    * Live: project `67da6e57...` scores 4.9 (At risk), `Cluster0` 5.3, `cluster-free` 4.4;
+      the two `0.0.0.0/0` and two termination-protection FAILs are the top quick wins.
+
+39. **HTML restyle and a safe-harbour line.** The customer wanted the portal to read more
+    MongoDB: header gradient Evergreen to Forest with a Spring Green glow, pill chips, rounded
+    cards with a soft shadow, green section rules, tabular numerals. Red and amber remain
+    status-only. Every page footer now ends with "Made by GuideV. Not an officially supported
+    MongoDB tool." plus one sentence that findings are advisory, defined once in
+    `common/html_theme.py` so the regex dashboard carries it as well.
 
 ### Known limitations / follow-ups
 

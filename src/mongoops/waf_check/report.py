@@ -21,6 +21,7 @@ from mongoops.waf_check.model import (
     Pillar,
     Status,
 )
+from mongoops.waf_check.score import Score, score, score_by_pillar
 
 OutputFormat = Literal["table", "json", "html"]
 
@@ -123,7 +124,11 @@ def json_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "scope": {**asdict(scope), "generated_at": scope.resolved_time()},
-        "summary": {"by_status": count_by_status(results), "by_pillar": count_by_pillar(results)},
+        "summary": {
+            "score": score_summary(results),
+            "by_status": count_by_status(results),
+            "by_pillar": count_by_pillar(results),
+        },
         "checks": [r.to_dict() for r in sort_results(results) if r.kind is Kind.AUTO],
     }
     if include_discuss:
@@ -152,12 +157,15 @@ def render_project_json(reports: Sequence[ClusterReport], scope: ProjectScope) -
         "catalog": CATALOG_VERSION,
         "scope": {**asdict(scope), "generated_at": scope.resolved_time()},
         "summary": {
+            "score": score_summary(everything),
             "by_status": count_by_status(everything),
             "by_cluster": {
-                rep.scope.cluster: count_by_status(
-                    tuple(r for r in rep.results if r.kind is Kind.AUTO)
-                )
+                rep.scope.cluster: {
+                    "score": score(auto).to_dict(),
+                    **count_by_status(auto),
+                }
                 for rep in reports
+                for auto in (tuple(r for r in rep.results if r.kind is Kind.AUTO),)
             },
         },
         "clusters": [
@@ -168,6 +176,25 @@ def render_project_json(reports: Sequence[ClusterReport], scope: ProjectScope) -
     return json.dumps(payload, indent=2, ensure_ascii=False, default=_jsonable)
 
 
+def score_summary(results: Sequence[CheckResult]) -> dict[str, Any]:
+    """``score`` block for JSON: the total plus one entry per pillar."""
+    return {
+        **score(results).to_dict(),
+        "by_pillar": {p.value: s.to_dict() for p, s in score_by_pillar(results).items()},
+    }
+
+
+def score_line(s: Score) -> str:
+    """``Score 7.4 / 10 (Ready with gaps): 31 of 42 points from 23 checks`` for the table."""
+    if s.value is None:
+        return "Score: nothing could be scored (every check UNKNOWN, NA or off)"
+    tier = s.tier.label if s.tier else ""
+    return (
+        f"Score {s.value:.1f} / 10 ({tier}): {s.earned} of {s.possible} points, "
+        f"{s.passed} of {s.scored} scored checks pass"
+    )
+
+
 def render_project_table(reports: Sequence[ClusterReport], scope: ProjectScope) -> str:
     console = Console(record=True, width=200, file=io.StringIO(), force_terminal=False)
     everything = project_results(reports)
@@ -176,6 +203,7 @@ def render_project_table(reports: Sequence[ClusterReport], scope: ProjectScope) 
         f"WAF readiness for project {scope.project_id}: {len(reports)} cluster(s), "
         f"policy {scope.policy_profile or 'defaults'}"
     )
+    console.print(score_line(score(everything)))
     console.print(
         "  ".join(
             f"{s.value} {counts[s.value]}"
@@ -205,14 +233,19 @@ def cluster_actions(reports: Sequence[ClusterReport]) -> tuple[tuple[str, CheckR
 
 def _rollup_table(reports: Sequence[ClusterReport]) -> Table:
     t = Table(title=f"Clusters ({len(reports)})", show_lines=False)
-    for col in ("cluster", "tier", "mongodb", "FAIL", "WARN", "UNKNOWN", "PASS", "NA/off"):
-        t.add_column(col, justify="right" if col.isupper() or col == "NA/off" else "left")
+    for col in ("cluster", "tier", "mongodb", "score", "FAIL", "WARN", "UNKNOWN", "PASS", "NA/off"):
+        t.add_column(
+            col, justify="right" if col.isupper() or col in ("NA/off", "score") else "left"
+        )
     for rep in reports:
-        c = count_by_status(tuple(r for r in rep.results if r.kind is Kind.AUTO))
+        auto = tuple(r for r in rep.results if r.kind is Kind.AUTO)
+        c = count_by_status(auto)
+        s = score(auto)
         t.add_row(
             rep.scope.cluster,
             rep.scope.tier or "?",
             rep.scope.version or "?",
+            f"{s.value:.1f}" if s.value is not None else "-",
             f"[{_STATUS_STYLE[Status.FAIL]}]{c['FAIL']}[/]" if c["FAIL"] else "0",
             f"[{_STATUS_STYLE[Status.WARN]}]{c['WARN']}[/]" if c["WARN"] else "0",
             str(c["UNKNOWN"]),
@@ -267,6 +300,7 @@ def render_table(results: Sequence[CheckResult], scope: Scope) -> str:
         f"{scope.tier or '?'} {scope.provider or ''} MongoDB {scope.version or '?'}, "
         f"policy {scope.policy_profile or 'defaults'})"
     )
+    console.print(score_line(score(results)))
     console.print(
         "  ".join(
             f"{s.value} {counts[s.value]}"

@@ -14,7 +14,7 @@ from html import escape
 from typing import Any
 
 from mongoops import __version__
-from mongoops.common.html_theme import BASE_CSS, TABLE_JS
+from mongoops.common.html_theme import BASE_CSS, SAFE_HARBOUR_HTML, TABLE_JS
 from mongoops.regex_finder.analyze import Finding
 from mongoops.regex_finder.detector import RegexCategory
 from mongoops.regex_finder.remedy import (
@@ -83,6 +83,7 @@ def render_html(
 <style>{_CSS}</style></head>
 <body>
 <header>
+  <div class="brand"><i></i>MongoDB Atlas &middot; Performance</div>
   <h1><code>$regex</code> usage dashboard</h1>
   <div class="sub">mongoops regex-finder {escape(__version__)} &middot; slow queries with regular
   expressions, grouped by shape and ranked by how badly they defeat indexes</div>
@@ -94,7 +95,7 @@ def render_html(
 </main>
 <footer>Generated {escape(generated)} by <code>mongoops regex-finder {escape(meta.source)}</code>.
 Counts are per slow operation logged; one operation with several regexes yields several
-usages.</footer>
+usages.{SAFE_HARBOUR_HTML}</footer>
 <script>{_JS}</script>
 </body></html>
 """

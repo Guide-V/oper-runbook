@@ -375,6 +375,35 @@ point-in-time restore off, auditing off), `warn` for governance and recommendati
 zone may legitimately decide differently (tags, alerts, autoscaling, BYOK, snapshot copies,
 maintenance window, password users). Change any of them in `checks:`.
 
+### The score out of 10
+
+Counts do not compare well between clusters with a different number of applicable checks, and
+they give the team nothing to aim for. Every report therefore also carries one score out of 10,
+for the cluster, for the project (`--all-clusters`) and for each pillar. It is plain arithmetic:
+
+| Rule | Detail |
+| --- | --- |
+| What counts | Checks that were actually evaluated: `PASS`, `WARN`, `FAIL`. Attested discussion items count once attested. |
+| What does not | `UNKNOWN`, `NA`, `SKIPPED` and open `DISCUSS` items. A narrow API key never lowers the score. |
+| Weight | 2 points for a check the policy treats as `fail`, 1 point for `warn`. |
+| Earned | A passing check earns its weight; a failing one earns nothing. Fixing a FAIL is worth twice a WARN. |
+| Score | `10 x earned / possible`, one decimal. |
+
+| Tier | Score |
+| --- | --- |
+| Well-architected | 9.0 and above |
+| Ready with gaps | 7.0 to 8.9 |
+| Needs work | 5.0 to 6.9 |
+| At risk | below 5.0 |
+
+The HTML page shows the score as a ring with the tier, the arithmetic behind it ("16 of 30
+points, 12 of 24 scored checks pass"), how many fixes reach the next tier, and the three
+"quick wins" worth the most points (a project-wide setting failing on every cluster shows once
+with the combined gain). The table prints a `Score 5.3 / 10 (Needs work)` line and a `score`
+column in the cluster roll-up; JSON carries `summary.score` (with `by_pillar`) and
+`summary.by_cluster.<name>.score`. The score is presentation only: `--fail-on` still gates on
+statuses, and the number never changes what a check reports.
+
 ### What is checked
 
 30 automatic checks and 17 discussion items; `mongoops waf-check checks` prints the full list.
@@ -417,15 +446,17 @@ A read-only key is enough for a first report; the HTML lists what it could not r
 ### Output and gating
 
 `-f table|json|html`, `-o FILE`, `--html FILE` (always in addition). The JSON has
-`summary.by_status`, `summary.by_pillar`, `checks[]` (id, status, severity, evidence, remedy,
-doc) and `discuss[]`. `--fail-on fail` exits 1 on any `FAIL`; `--fail-on warn` also on `WARN`;
+`summary.score`, `summary.by_status`, `summary.by_pillar`, `checks[]` (id, status, severity,
+evidence, remedy, doc) and `discuss[]`. Every HTML page uses the MongoDB palette (Spring Green,
+Forest Green, Evergreen on white) and ends with the safe-harbour line "Made by GuideV. Not an
+officially supported MongoDB tool." `--fail-on fail` exits 1 on any `FAIL`; `--fail-on warn` also on `WARN`;
 default `never` (exit 0, findings or not, 2 on usage or API errors). `UNKNOWN` never trips
 the gate.
 
 `-c NAME` scores one cluster plus the project settings it inherits (access list, audit, alerts,
 maintenance window). `--all-clusters` scores every cluster in the project against the same
 policy and attestations, fetching the project facts once: the table and HTML open with a
-roll-up (FAIL / WARN / UNKNOWN / PASS per cluster) and the action items across clusters, then
+roll-up (score and FAIL / WARN / UNKNOWN / PASS per cluster) and the action items across clusters, then
 one section per cluster, then the discussion items once. The JSON nests one per-cluster payload
 each under `clusters[]` with `summary.by_cluster` on top. `--fail-on` looks at the union.
 
@@ -665,8 +696,9 @@ src/mongoops/
     attest.py                attestations for discuss items: load/validate, apply, expiry, template
     facts.py                 Atlas Admin API collectors (project once, cluster each); 401/403 -> UNKNOWN
     checks.py                pure evaluators, one per auto check
+    score.py                 pure score out of 10: weights, tiers, per pillar, quick wins, next tier
     report.py                table / json rendering, Scope, project roll-up, sorting and counts
-    html_report.py           self-contained HTML scorecard (cluster and project pages)
+    html_report.py           self-contained HTML scorecard (cluster and project pages, score ring)
     cli.py                   typer sub-commands: atlas (-c | --all-clusters), init, attest-init, checks
   regex_finder/
     detector.py              pure regex detection + index-friendliness classification

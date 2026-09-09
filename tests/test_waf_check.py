@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from mongoops.waf_check import checks as ck
+from mongoops.waf_check import score as sc
 from mongoops.waf_check.attest import (
     AttestationError,
     apply_attestations,
@@ -20,7 +21,7 @@ from mongoops.waf_check.attest import (
 )
 from mongoops.waf_check.catalog import AUTO_CHECKS, CATALOG, DISCUSS_CHECKS
 from mongoops.waf_check.facts import Fact
-from mongoops.waf_check.model import Kind, Pillar, Severity, Status
+from mongoops.waf_check.model import CheckResult, Kind, Pillar, Severity, Status
 from mongoops.waf_check.policy import (
     DEFAULT_POLICY,
     PolicyError,
@@ -455,3 +456,127 @@ class TestRender:
             assert heading in html
         assert "Project Owner" in html
         assert "http://" not in html.replace("https://", "")  # no external assets
+
+    def test_score_appears_in_every_format(self) -> None:
+        results = ck.evaluate(bad_facts(), DEFAULT_POLICY)
+        s = sc.score(results)
+        assert s.value is not None
+        payload = json.loads(render(results, SCOPE, fmt="json"))
+        assert payload["summary"]["score"]["value"] == s.value
+        assert payload["summary"]["score"]["tier"] == s.tier.label
+        assert set(payload["summary"]["score"]["by_pillar"]) == {p.value for p in Pillar}
+        assert f"Score {s.value:.1f} / 10 ({s.tier.label})" in render(results, SCOPE, fmt="table")
+        html = render(results, SCOPE, fmt="html")
+        assert f'data-score="{s.value:.1f}"' in html
+        assert "Quick wins" in html and 'class="meter"' in html
+        assert "Made by GuideV. Not an officially supported MongoDB tool." in html
+
+
+class TestScore:
+    """The score is arithmetic over the results, so the tests pin the arithmetic."""
+
+    @staticmethod
+    def _r(status: Status, severity: Severity = Severity.FAIL, pillar: Pillar = Pillar.SECURITY):
+        return CheckResult(
+            id=f"x.{status.value.lower()}.{severity.value}",
+            pillar=pillar,
+            title="t",
+            kind=Kind.AUTO,
+            status=status,
+            severity=severity,
+            message="",
+            evidence={},
+            remedy="",
+            doc="https://example.invalid",
+        )
+
+    def test_weights_and_value(self) -> None:
+        results = (
+            self._r(Status.PASS, Severity.FAIL),  # +2 of 2
+            self._r(Status.PASS, Severity.WARN),  # +1 of 1
+            self._r(Status.FAIL, Severity.FAIL),  # +0 of 2
+            self._r(Status.WARN, Severity.WARN),  # +0 of 1
+        )
+        s = sc.score(results)
+        assert (s.earned, s.possible, s.passed, s.scored) == (3, 6, 2, 4)
+        assert s.value == 5.0 and s.tier.label == "Needs work"
+
+    def test_unknown_na_skipped_and_open_discuss_do_not_count(self) -> None:
+        base = (self._r(Status.PASS, Severity.FAIL),)
+        noise = tuple(self._r(st) for st in (Status.UNKNOWN, Status.NA, Status.SKIPPED))
+        discuss = (replace(self._r(Status.DISCUSS, Severity.OFF), kind=Kind.DISCUSS),)
+        assert sc.score(base + noise + discuss) == sc.score(base)
+        assert sc.score(base).value == 10.0
+        assert sc.score(noise).value is None and sc.score(noise).tier is None
+
+    def test_tier_boundaries_use_the_rounded_value(self) -> None:
+        assert sc.tier_for(10.0).label == "Well-architected"
+        assert sc.tier_for(9.0).label == "Well-architected"
+        assert sc.tier_for(8.9).label == "Ready with gaps"
+        assert sc.tier_for(7.0).label == "Ready with gaps"
+        assert sc.tier_for(6.9).label == "Needs work"
+        assert sc.tier_for(5.0).label == "Needs work"
+        assert sc.tier_for(4.9).label == "At risk"
+        assert sc.tier_for(0.0).label == "At risk"
+
+    def test_attesting_a_discussion_item_moves_the_score(self) -> None:
+        results = ck.evaluate(good_facts(), DEFAULT_POLICY)
+        before = sc.score(results)
+        attested = apply_attestations(
+            results,
+            attestations_from_mapping(
+                {
+                    "attestations": {
+                        "rel.discuss.dr-runbook-and-drill": {
+                            "status": "fail",
+                            "owner": "sre",
+                            "date": "2026-08-15",
+                        }
+                    }
+                }
+            ),
+            today=date(2026, 9, 1),
+        )
+        after = sc.score(attested)
+        assert before.value == 10.0
+        assert after.possible == before.possible + 2  # attested FAIL weighs like a fail check
+        assert after.earned == before.earned
+        assert after.value < before.value
+
+    def test_quick_wins_rank_fail_checks_first_and_show_the_gain(self) -> None:
+        results = (
+            self._r(Status.PASS, Severity.FAIL),
+            self._r(Status.WARN, Severity.WARN),
+            self._r(Status.FAIL, Severity.FAIL),
+        )
+        wins = sc.quick_wins(results)
+        assert [w.result.status for w in wins] == [Status.FAIL, Status.WARN]
+        assert [w.gain for w in wins] == [4.0, 2.0]  # 2/5 and 1/5 of 10
+        assert all(w.occurrences == 1 for w in wins)
+
+    def test_quick_wins_group_the_same_check_across_clusters(self) -> None:
+        # Two clusters both fail the project-wide network check: one win, doubled gain.
+        shared = self._r(Status.FAIL, Severity.FAIL)
+        results = (shared, shared, self._r(Status.PASS, Severity.WARN))
+        (win,) = sc.quick_wins(results)
+        assert win.occurrences == 2 and win.gain == 8.0  # 4 of 5 points
+        assert sc.quick_wins((self._r(Status.UNKNOWN),)) == ()
+
+    def test_fixes_to_next_tier(self) -> None:
+        # 3 of 6 points -> 5.0 (Needs work). One fail fix -> 5/6 -> 8.3 (Ready with gaps).
+        results = (
+            self._r(Status.PASS, Severity.FAIL),
+            self._r(Status.PASS, Severity.WARN),
+            self._r(Status.FAIL, Severity.FAIL),
+            self._r(Status.WARN, Severity.WARN),
+        )
+        target, n = sc.fixes_to_next_tier(results)
+        assert (target.label, n) == ("Ready with gaps", 1)
+        assert sc.fixes_to_next_tier((self._r(Status.PASS),)) is None  # already top tier
+        assert sc.fixes_to_next_tier((self._r(Status.UNKNOWN),)) is None  # nothing scoreable
+
+    def test_fixture_clusters_land_in_sensible_tiers(self) -> None:
+        assert sc.score(ck.evaluate(good_facts(), DEFAULT_POLICY)).value == 10.0
+        bad = sc.score(ck.evaluate(bad_facts(), DEFAULT_POLICY))
+        assert bad.value is not None and bad.value < 7.0
+        assert bad.to_dict()["tier"] == bad.tier.label
