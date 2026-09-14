@@ -18,7 +18,8 @@ from mongoops.common.perf_advisor import ApiError, SlowQueryWindow
 from mongoops.common.timeutil import parse_duration_ms, parse_since_ms
 from mongoops.regex_finder import sources
 from mongoops.regex_finder.analyze import AnalyzeOptions, Finding, SourceLine, analyze_lines
-from mongoops.regex_finder.report import ReportMeta, render
+from mongoops.regex_finder.remedy import Remedy
+from mongoops.regex_finder.report import ReportMeta, render, summarize
 
 app = typer.Typer(
     name="regex-finder",
@@ -81,6 +82,14 @@ DurationOpt = Annotated[
 NLogsOpt = Annotated[
     int, typer.Option("--n-logs", help="Max log lines per process (API max 20000).")
 ]
+FailOnOpt = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--fail-on",
+        help="Exit 1 when any shape has one of these remedies (repeatable or comma separated), "
+        "e.g. --fail-on search,fix_filter,btree_index.",
+    ),
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +100,19 @@ class OutputOptions:
     max_rows: int
     meta: ReportMeta
     html: Path | None = None
+    fail_on: frozenset[Remedy] = frozenset()
+
+
+def parse_fail_on(values: list[str] | None) -> frozenset[Remedy]:
+    """``["search,fix_filter", "btree_index"]`` -> remedies; unknown names are a usage error."""
+    names = tuple(n.strip() for v in values or () for n in v.split(",") if n.strip())
+    unknown = tuple(n for n in names if n not in Remedy.__members__.values())
+    if unknown:
+        raise ValueError(
+            f"--fail-on: unknown remedy {', '.join(unknown)}; "
+            f"choose from {', '.join(r.value for r in Remedy)}"
+        )
+    return frozenset(Remedy(n) for n in names)
 
 
 def _meta(
@@ -160,6 +182,11 @@ def _emit(lines: Iterable[SourceLine], analyze: AnalyzeOptions, out: OutputOptio
         # soft_wrap keeps the URI on one line so terminals can make it clickable
         err.print(f"[green]Dashboard: {out.html.resolve().as_uri()}[/green]", soft_wrap=True)
     err.print(f"[dim]{len(findings)} regex usage(s) found[/dim]")
+    blocking = tuple(r for r in summarize(findings) if r.remedy in out.fail_on)
+    if blocking:
+        for r in blocking:
+            err.print(f"[red]blocking:[/red] {r.namespace} {r.field} {r.command} -> {r.remedy}")
+        raise typer.Exit(code=1)
 
 
 def _write(path: Path, text: str) -> None:
@@ -214,12 +241,17 @@ def atlas(
     output: OutputOpt = None,
     html: HtmlOpt = None,
     max_rows: MaxRowsOpt = 50,
+    fail_on: FailOnOpt = None,
 ) -> None:
     """Atlas: pull Performance Advisor slow query logs for a cluster and report $regex usage.
 
     Credentials from MONGODB_ATLAS_PUBLIC_API_KEY / MONGODB_ATLAS_PRIVATE_API_KEY (digest) or
     MONGODB_ATLAS_CLIENT_ID / MONGODB_ATLAS_CLIENT_SECRET (service account). A .env file is read.
     """
+    try:
+        gate = parse_fail_on(fail_on)
+    except ValueError as exc:
+        _fail(str(exc))
     if not cluster and not process:
         _fail("pass --cluster NAME or at least one --process host:port")
     try:
@@ -255,7 +287,7 @@ def atlas(
                     _progress,
                 ),
                 _analyze_options(namespace, include_getmore, min_ms),
-                OutputOptions(fmt, view, output, max_rows, meta, html),
+                OutputOptions(fmt, view, output, max_rows, meta, html, gate),
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
@@ -304,12 +336,17 @@ def ops_manager(
     output: OutputOpt = None,
     html: HtmlOpt = None,
     max_rows: MaxRowsOpt = 50,
+    fail_on: FailOnOpt = None,
 ) -> None:
     """Enterprise Advanced: pull Ops Manager Performance Advisor slow queries, report $regex usage.
 
     Credentials from MONGODB_OPS_MANAGER_PUBLIC_API_KEY / MONGODB_OPS_MANAGER_PRIVATE_API_KEY.
     Without host filters every host in the project is queried.
     """
+    try:
+        gate = parse_fail_on(fail_on)
+    except ValueError as exc:
+        _fail(str(exc))
     env_cfg = ops_manager_api.config_from_env()
     cfg = ops_manager_api.OpsManagerConfig(
         base_url=base_url or env_cfg.base_url,
@@ -349,7 +386,7 @@ def ops_manager(
                     _progress,
                 ),
                 _analyze_options(namespace, include_getmore, min_ms),
-                OutputOptions(fmt, view, output, max_rows, meta, html),
+                OutputOptions(fmt, view, output, max_rows, meta, html, gate),
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
@@ -368,8 +405,13 @@ def logfile(
     output: OutputOpt = None,
     html: HtmlOpt = None,
     max_rows: MaxRowsOpt = 50,
+    fail_on: FailOnOpt = None,
 ) -> None:
     """Parse a mongod log file directly (EA without Ops Manager, or exported Atlas logs)."""
+    try:
+        gate = parse_fail_on(fail_on)
+    except ValueError as exc:
+        _fail(str(exc))
     if path != "-" and not Path(path).exists():
         _fail(f"file not found: {path}")
     meta = _meta(
@@ -382,7 +424,7 @@ def logfile(
     _emit(
         sources.file_lines(path),
         _analyze_options(namespace, include_getmore, min_ms),
-        OutputOptions(fmt, view, output, max_rows, meta, html),
+        OutputOptions(fmt, view, output, max_rows, meta, html, gate),
     )
 
 
@@ -397,8 +439,13 @@ def live(
     output: OutputOpt = None,
     html: HtmlOpt = None,
     max_rows: MaxRowsOpt = 50,
+    fail_on: FailOnOpt = None,
 ) -> None:
     """Read the server's in-memory log (getLog) over a live connection; handy for atlas-local."""
+    try:
+        gate = parse_fail_on(fail_on)
+    except ValueError as exc:
+        _fail(str(exc))
     meta = _meta(
         "live",
         f"{_redact_uri(uri)} (getLog ring buffer)",
@@ -410,7 +457,7 @@ def live(
         _emit(
             sources.getlog_lines(uri),
             _analyze_options(namespace, include_getmore, min_ms),
-            OutputOptions(fmt, view, output, max_rows, meta, html),
+            OutputOptions(fmt, view, output, max_rows, meta, html, gate),
         )
     except Exception as exc:  # pymongo raises many connection error types
         _fail(f"{type(exc).__name__}: {exc}")

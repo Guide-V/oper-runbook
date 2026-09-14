@@ -1,0 +1,111 @@
+# waf-check attestations: outcomes of the "discuss these" items.
+# Fill in after the landing-zone workshop and pass with `waf-check atlas --attest FILE`.
+#   status: open | pass | fail | warn | na   (open = not settled yet, stays DISCUSS)
+#   owner:  team or person accountable      (required once status is not open)
+#   date:   YYYY-MM-DD of the decision       (entries older than valid_days expire)
+#   note:   the decision itself, or a link to it
+valid_days: 365
+
+attestations:
+  # Organization / project layout and prod vs non-prod isolation
+  ops.discuss.org-structure:
+    status: open
+    owner:
+    date:
+    note:
+  # Clusters, tags and alert rules provisioned through Terraform
+  ops.discuss.infrastructure-as-code:
+    status: open
+    owner:
+    date:
+    note:
+  # Roles, responsibilities and change control for Atlas
+  ops.discuss.roles-and-change-control:
+    status: open
+    owner:
+    date:
+    note:
+  # MongoDB Support engagement process and team training
+  ops.discuss.support-and-training:
+    status: open
+    owner:
+    date:
+    note:
+  # Developer tooling and access model
+  ops.discuss.developer-access:
+    status: open
+    owner:
+    date:
+    note:
+  # Federated authentication for the Atlas UI and database access
+  sec.discuss.federated-authentication:
+    status: open
+    owner:
+    date:
+    note:
+  # Client-Side Field Level Encryption / Queryable Encryption for sensitive fields
+  sec.discuss.field-level-encryption:
+    status: open
+    owner:
+    date:
+    note:
+  # No pinned or hard-coded certificate authority in applications
+  sec.discuss.certificate-authority:
+    status: open
+    owner:
+    date:
+    note:
+  # Applicable compliance standards identified
+  sec.discuss.compliance-standards:
+    status: open
+    owner:
+    date:
+    note:
+  # RPO and RTO documented per application
+  rel.discuss.rpo-rto:
+    status: open
+    owner:
+    date:
+    note:
+  # Disaster recovery runbook written and restore drill performed
+  rel.discuss.dr-runbook-and-drill:
+    status: open
+    owner:
+    date:
+    note:
+  # Applications survive a primary failover
+  rel.discuss.failover-and-retryable-writes:
+    status: open
+    owner:
+    date:
+    note:
+  # Schema and index review cadence
+  perf.discuss.schema-and-index-review:
+    status: open
+    owner:
+    date:
+    note:
+  # Read preference locality and sharding strategy
+  perf.discuss.read-locality-and-sharding:
+    status: open
+    owner:
+    date:
+    note:
+  # Idle and oversized clusters reviewed
+  cost.discuss.idle-and-oversized:
+    status: open
+    owner:
+    date:
+    note:
+  # Data lifecycle: TTL indexes and Online Archive
+  cost.discuss.data-lifecycle:
+    status: open
+    owner:
+    date:
+    note:
+  # Billing data and cost allocation by tag
+  cost.discuss.billing-visibility:
+    status: open
+    owner:
+    date:
+    note:

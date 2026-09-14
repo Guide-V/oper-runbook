@@ -62,6 +62,21 @@ def test_logfile_json_to_file_with_filters(tmp_path: Path) -> None:
     )  # getMores were 0 ms
 
 
+def test_logfile_fail_on_gates_on_remedy() -> None:
+    base = ["regex-finder", "logfile", FIXTURE, "-f", "json"]
+    clean = runner.invoke(app, [*base, "--fail-on", "search"])  # local fixture: no Search shape
+    assert clean.exit_code == 0, clean.output
+    remedies = {r["remedy"] for r in json.loads(clean.stdout)["summary"]}
+    assert remedies and "search" not in remedies, remedies
+    gated = runner.invoke(app, [*base, "--fail-on", ",".join(sorted(remedies))])
+    assert gated.exit_code == 1, gated.output
+    assert "blocking:" in gated.output
+    assert json.loads(gated.stdout)["summary"]  # the report is still written before exiting 1
+    typo = runner.invoke(app, [*base, "--fail-on", "search,shrug"])
+    assert typo.exit_code == 2
+    assert "unknown remedy shrug" in typo.output
+
+
 def test_logfile_gzip_and_stdin(tmp_path: Path) -> None:
     gz = tmp_path / "mongod.log.gz"
     with gzip.open(gz, "wt") as fh:

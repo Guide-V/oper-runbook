@@ -159,7 +159,11 @@ def cluster_hosts(client: httpx.Client, group_id: str, cluster_name: str) -> fro
     the mongos hosts, which are co-located with the shard mongods.
     """
     body = get_json(client, f"/groups/{group_id}/clusters/{cluster_name}")
-    standard = (body.get("connectionStrings") or {}).get("standard") or ""
+    return hosts_from_connection_string((body.get("connectionStrings") or {}).get("standard") or "")
+
+
+def hosts_from_connection_string(standard: str) -> frozenset[str]:
+    """Lower-cased hostnames (no port) of a ``mongodb://h1:p,h2:p/...`` string. Pure."""
     return frozenset(host.lower() for host, _port in _HOSTPORT.findall(standard))
 
 
