@@ -43,6 +43,12 @@ out/
 reports/
 *.csv
 !tests/fixtures/**/*.csv
+# waf-check reports and baselines name a real project, its clusters and findings
+*baseline*.json
+waf-*.json
+waf-*.html
+*.pdf
+!tests/fixtures/**/*.json
 
 # --- editors / os ---
 .DS_Store

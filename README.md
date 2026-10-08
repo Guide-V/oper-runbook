@@ -7,7 +7,7 @@ entry point, `mongoops`, and one sub-command per script.
 | Script | Command | What it does |
 | --- | --- | --- |
 | regex-finder | `mongoops regex-finder ...` | Finds `$regex` usage in slow queries reported by Performance Advisor (Atlas or Ops Manager) or found in mongod logs, and classifies each regex for index-friendliness. |
-| waf-check | `mongoops waf-check ...` | Scores one Atlas cluster against the [operational-readiness checklist](https://www.mongodb.com/docs/atlas/architecture/current/operational-readiness-checklist/) and the five Well-Architected pillars, using read-only Admin API facts and a landing-zone policy you own. Atlas only. |
+| waf-check | `mongoops waf-check ...` | Scores an Atlas cluster, or every cluster in a project, against the [operational-readiness checklist](https://www.mongodb.com/docs/atlas/architecture/current/operational-readiness-checklist/) and the five Well-Architected pillars, using read-only Admin API facts and a landing-zone policy you own. Compares each run with an earlier one (baseline) to show what regressed or got fixed. Atlas only. |
 
 ## Requirements
 
@@ -332,14 +332,23 @@ mongoops waf-check atlas -c <ClusterName> --attest attestations.yaml
 
 # 5. Whole project: one page, project facts fetched once, roll-up per cluster
 mongoops waf-check atlas --all-clusters --policy landing-zone.prod.yaml --attest attestations.yaml \
-  --html reports/waf-project.html
+  --html reports/waf-project.html --json reports/waf-project-0901.json
 
-# 6. See every check id and its default severity (the keys of the policy's `checks:` section)
+# 6. A month later: what changed since then, and exit 1 only if something got worse
+mongoops waf-check atlas --all-clusters --policy landing-zone.prod.yaml --attest attestations.yaml \
+  --baseline reports/waf-project-0901.json --fail-on regression \
+  --html reports/waf-project.html --json reports/waf-project-1001.json
+
+# 7. See every check id and its default severity (the keys of the policy's `checks:` section)
 mongoops waf-check checks
 ```
 
-`make probe-waf ATLAS_CLUSTER=<name> [POLICY=file] [ATTEST=file]` does step 1 and drops the HTML
-in `reports/`; `make probe-waf-project` does step 5.
+`make probe-waf ATLAS_CLUSTER=<name> [POLICY=file] [ATTEST=file] [BASELINE=file]` does step 1 and
+`make probe-waf-project` step 5 (or 6 with `BASELINE`). Each run drops a dated HTML and JSON in
+`reports/` and refreshes `reports/<target>-latest.{html,json}`, so
+`make probe-waf-project BASELINE=reports/probe-waf-project-latest.json` compares with the previous
+run. The links follow a run that `--fail-on` exits 1 on too, but not a usage error (nothing is
+written then).
 
 ### How a check is scored
 
@@ -443,15 +452,64 @@ Highlights per pillar, with the Admin API evidence:
 
 A read-only key is enough for a first report; the HTML lists what it could not read.
 
+### Baseline comparison: what changed since last time
+
+A score on its own does not say whether last month's workshop actions landed, or whether someone
+has opened the access list since. `--baseline FILE` takes an earlier JSON report of the same
+project (`-f json -o FILE` or `--json FILE`) and compares every check with it, per cluster:
+
+| Change | When | `--fail-on regression` |
+| --- | --- | --- |
+| Regressed | A `FAIL` / `WARN` the baseline did not have ("new finding", also when the baseline could not see it), `WARN` -> `FAIL` ("worse"), or any finding on a cluster that is not in the baseline ("new cluster") | exits 1 |
+| No longer evaluated | Scored in the baseline, now `UNKNOWN`, `NA`, `SKIPPED`, open `DISCUSS` or missing: a lost API role, a check switched `off`, an attestation that expired | listed, not gated |
+| New check | The check id is not in the baseline at all (a newer catalog added it) | listed, not gated |
+| Improved | `FAIL` -> `WARN` | |
+| Fixed | `FAIL` / `WARN` -> `PASS` | |
+| Now evaluated | Not scored in the baseline, `PASS` now | |
+
+The rules are there to keep the comparison honest. Switching a check off, losing a role or letting
+an attestation lapse never counts as a fix, and upgrading the tool never counts as a regression.
+Clusters that disappeared are listed as "not in this run" and not gated. The same score arithmetic
+runs on both sides, so the deltas (overall, per pillar, per cluster) are like for like. When they
+are not, the report says so in a "Not like for like" note: the catalog changed, the policy profile
+changed, or the same profile's rules changed (every report carries `scope.policy_fingerprint`, 12
+hex characters of the effective policy).
+
+What you get:
+
+* **HTML**: the score ring counts from the baseline score to today's, with a `+0.8 since
+  baseline` or `-0.4 since baseline` pill (in words as well as colour). A "Changes since
+  baseline" section follows the score: counters per change kind, the baseline file with its
+  SHA-256 (proof of which report was compared), score tables per pillar (and per cluster for a
+  project), then one row per changed check with before -> after status and today's evidence.
+* **Table**: `Since baseline 2026-09-01 03:00:00 UTC: score 7.3 -> 6.9 (-0.4); regressed 2,
+  fixed 19` plus the changed checks. The same line goes to stderr for every format, so a pipeline
+  log shows it.
+* **JSON**: a `comparison` block with `baseline` (path, sha256, generated_at), `score`,
+  `by_pillar`, `by_cluster`, `counts`, `clusters_added`, `clusters_removed`, `notes` and
+  `changes[]` (cluster, id, pillar, title, change, reason, before, after, message). Score entries
+  carry `before`, `after`, `delta` and both tiers. The rest of the report is unchanged,
+  so a run with a baseline is itself a valid baseline for the next one.
+
+The baseline has to cover the run. A `-c NAME` run takes a cluster report of that cluster or a
+project report that contains it; an `--all-clusters` run needs an `--all-clusters` baseline; the
+project id must match. A mismatch is a usage error (exit 2) found before any API call. Keep the
+baseline JSON out of git: it names the project, its clusters and their findings (`.gitignore`
+already covers `reports/`, `*baseline*.json` and `waf-*.json`).
+
 ### Output and gating
 
-`-f table|json|html`, `-o FILE`, `--html FILE` (always in addition). The JSON has
-`summary.score`, `summary.by_status`, `summary.by_pillar`, `checks[]` (id, status, severity,
-evidence, remedy, doc) and `discuss[]`. Every HTML page uses the MongoDB palette (Spring Green,
-Forest Green, Evergreen on white) and ends with the safe-harbour line "Made by GuideV. Not an
-officially supported MongoDB tool." `--fail-on fail` exits 1 on any `FAIL`; `--fail-on warn` also on `WARN`;
-default `never` (exit 0, findings or not, 2 on usage or API errors). `UNKNOWN` never trips
-the gate.
+`-f table|json|html`, `-o FILE`, plus `--html FILE` and `--json FILE` (always in addition, from
+the same run and with the same `generated_at`). The JSON has `summary.score`,
+`summary.by_status`, `summary.by_pillar`, `checks[]` (id, status, severity, evidence, remedy,
+doc), `discuss[]`, and with `--baseline` the `comparison` block. Every HTML page uses the MongoDB
+palette (Spring Green, Forest Green, Evergreen on white) and ends with the safe-harbour line "Made
+by GuideV. Not an officially supported MongoDB tool."
+
+`--fail-on fail` exits 1 on any `FAIL`; `--fail-on warn` also on `WARN`; `--fail-on regression`
+(needs `--baseline`) only when a check regressed, so a cluster with known, accepted gaps can still
+gate on "no worse than last time". Default `never` (exit 0, findings or not). Usage and API errors
+exit 2. `UNKNOWN` never trips the gate.
 
 `-c NAME` scores one cluster plus the project settings it inherits (access list, audit, alerts,
 maintenance window). `--all-clusters` scores every cluster in the project against the same
@@ -610,6 +668,11 @@ Practical notes:
   "$PIPELINE_START" --fail-on warn` runs the same regex scan as check
   `perf.regex.index-hostile` alongside the configuration checks, with the blocking remedies
   taken from the landing-zone policy (`performance.regex_block_on`).
+* **Gate on drift, not on history.** For an environment with accepted gaps, keep an agreed
+  report as the baseline (a pipeline artifact or secret store, not the repo) and run
+  `waf-check atlas ... --baseline waf-baseline.json --fail-on regression --json new.json`: the
+  pipeline fails only when a change made something worse, and `new.json` can become the next
+  baseline once the change is accepted.
 
 ## Development
 
@@ -698,8 +761,10 @@ src/mongoops/
     checks.py                pure evaluators, one per auto check
     score.py                 pure score out of 10: weights, tiers, per pillar, quick wins, next tier
     report.py                table / json rendering, Scope, project roll-up, sorting and counts
-    html_report.py           self-contained HTML scorecard (cluster and project pages, score ring)
-    cli.py                   typer sub-commands: atlas (-c | --all-clusters), init, attest-init, checks
+    baseline.py              JSON report -> Snapshot, pure compare: change kinds, score deltas, notes
+    html_report.py           self-contained HTML scorecard (score ring, changes since baseline)
+    cli.py                   typer sub-commands: atlas (-c | --all-clusters, --baseline), init,
+                             attest-init, checks
   regex_finder/
     detector.py              pure regex detection + index-friendliness classification
     analyze.py               SlowQuery x RegexUsage -> Finding, filters

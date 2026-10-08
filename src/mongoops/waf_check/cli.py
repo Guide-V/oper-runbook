@@ -28,6 +28,14 @@ from mongoops.waf_check.attest import (
     load_attestations,
     render_attestations_yaml,
 )
+from mongoops.waf_check.baseline import (
+    BaselineError,
+    Comparison,
+    Snapshot,
+    compare,
+    load_baseline,
+    restrict,
+)
 from mongoops.waf_check.catalog import CATALOG, CATALOG_VERSION
 from mongoops.waf_check.checks import evaluate
 from mongoops.waf_check.facts import (
@@ -45,14 +53,17 @@ from mongoops.waf_check.policy import (
     Policy,
     PolicyError,
     load_policy,
+    policy_fingerprint,
     policy_from_mapping,
     render_policy_yaml,
 )
 from mongoops.waf_check.report import (
     ClusterReport,
+    OutputFormat,
     ProjectScope,
     Scope,
-    project_results,
+    comparison_line,
+    now_utc,
     render,
     render_project,
 )
@@ -75,6 +86,7 @@ class FailOn(StrEnum):
     never = "never"
     fail = "fail"
     warn = "warn"
+    regression = "regression"
 
 
 def _open_client(base_url: str) -> httpx.Client:
@@ -92,9 +104,22 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _scope(
-    facts: Facts, policy: Policy, policy_path: Path | None, attest_path: Path | None = None
+def _run_scope(
+    project_id: str, policy: Policy, policy_path: Path | None, attest_path: Path | None
 ) -> Scope:
+    """What every cluster of this run shares, stamped once so JSON and HTML carry one time."""
+    return Scope(
+        cluster="",
+        project_id=project_id,
+        policy_profile=policy.profile,
+        policy_path=str(policy_path) if policy_path else "built-in defaults",
+        policy_fingerprint=policy_fingerprint(policy),
+        attestations_path=str(attest_path) if attest_path else "",
+        generated_at=now_utc(),
+    )
+
+
+def _scope(facts: Facts, run: Scope) -> Scope:
     tier = next(
         (
             str((rc.get("electableSpecs") or {}).get("instanceSize") or "")
@@ -103,22 +128,23 @@ def _scope(
         ),
         "",
     )
-    return Scope(
+    return replace(
+        run,
         cluster=facts.cluster_name,
-        project_id=facts.group_id,
         provider=facts.provider,
         tier=tier,
         version=str(
             facts.cluster.get("mongoDBVersion") or facts.cluster.get("mongoDBMajorVersion") or ""
         ),
-        policy_profile=policy.profile,
-        policy_path=str(policy_path) if policy_path else "built-in defaults",
-        attestations_path=str(attest_path) if attest_path else "",
     )
 
 
-def exit_code(results: tuple[CheckResult, ...], fail_on: FailOn) -> int:
+def exit_code(
+    results: tuple[CheckResult, ...], fail_on: FailOn, comparison: Comparison | None = None
+) -> int:
     """0 unless the gate policy says otherwise. Pure."""
+    if fail_on is FailOn.regression:
+        return 1 if comparison is not None and comparison.regressed else 0
     statuses = {r.status for r in results}
     if fail_on is FailOn.fail and Status.FAIL in statuses:
         return 1
@@ -159,8 +185,20 @@ def atlas(
     ] = None,
     fail_on: Annotated[
         FailOn,
-        typer.Option("--fail-on", help="Exit 1 when a check has this status or worse."),
+        typer.Option(
+            "--fail-on",
+            help="Exit 1 when a check has this status or worse; `regression`: only when a check "
+            "got worse than in --baseline.",
+        ),
     ] = FailOn.never,
+    baseline_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--baseline",
+            help="Earlier waf-check JSON report (-f json or --json) of the same project to "
+            "compare with: what changed, score delta, and --fail-on regression.",
+        ),
+    ] = None,
     slow_queries_since: Annotated[
         str | None,
         typer.Option(
@@ -181,6 +219,12 @@ def atlas(
         Path | None,
         typer.Option("--html", help="Also write the self-contained HTML scorecard to this file."),
     ] = None,
+    json_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--json", help="Also write the JSON report to this file (the next run's --baseline)."
+        ),
+    ] = None,
 ) -> None:
     """Score a cluster (-c) or every cluster (--all-clusters): Atlas Admin API facts x
     landing-zone policy -> pillar scorecard.
@@ -191,11 +235,17 @@ def atlas(
     """
     if bool(cluster) == all_clusters:
         _fail("pass exactly one of --cluster NAME or --all-clusters")
+    if fail_on is FailOn.regression and baseline_file is None:
+        _fail("--fail-on regression needs --baseline FILE")
     try:
         policy = load_policy(policy_file) if policy_file else DEFAULT_POLICY
         attestations = load_attestations(attest_file) if attest_file else NO_ATTESTATIONS
-    except (PolicyError, AttestationError) as exc:
+        baseline = load_baseline(baseline_file) if baseline_file else None
+        if baseline is not None:  # fail on a baseline for another scope before any API call
+            restrict(baseline.snapshot, project_id, None if all_clusters else cluster)
+    except (PolicyError, AttestationError, BaselineError) as exc:
         _fail(str(exc))
+    run = _run_scope(project_id, policy, policy_file, attest_file)
     try:
         window = (
             SlowQueryWindow(since_ms=parse_since_ms(slow_queries_since))
@@ -208,51 +258,56 @@ def atlas(
             if not names:
                 _fail(f"project {project_id} has no clusters")
             reports = tuple(
-                _score_cluster(
-                    client,
-                    project_id,
-                    name,
-                    project,
-                    window,
-                    policy,
-                    attestations,
-                    policy_file,
-                    attest_file,
-                )
+                _score_cluster(client, name, project, window, policy, attestations, run)
                 for name in names
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
-    if all_clusters:
-        scope = ProjectScope(
-            project_id=project_id,
-            clusters=names,
-            policy_profile=policy.profile,
-            policy_path=str(policy_file) if policy_file else "built-in defaults",
-            attestations_path=str(attest_file) if attest_file else "",
-        )
-        results = project_results(reports)
-        text = render_project(reports, scope, fmt=fmt.value)
-        html_text = render_project(reports, scope, fmt="html") if html else ""
-    else:
-        (report,) = reports
-        results = report.results
-        text = render(results, report.scope, fmt=fmt.value)
-        html_text = render(results, report.scope, fmt="html") if html else ""
+    snapshot = Snapshot(
+        reports=reports,
+        project=_project_scope(run, names) if all_clusters else None,
+    )
+    comparison = compare(baseline, snapshot) if baseline is not None else None
+    text = _render(snapshot, fmt.value, comparison)
     if output:
         _write(output, text)
         err.print(f"[green]Wrote {output}[/green]")
     else:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    if json_file:
+        _write(json_file, _render(snapshot, "json", comparison))
+        err.print(f"[green]Wrote {json_file}[/green]")
     if html:
-        _write(html, html_text)
+        _write(html, _render(snapshot, "html", comparison))
         err.print(f"[green]Scorecard: {html.resolve().as_uri()}[/green]", soft_wrap=True)
+    results = snapshot.results()
     counts = {s: sum(1 for r in results if r.status is s) for s in Status}
     err.print(
         f"[dim]FAIL {counts[Status.FAIL]}  WARN {counts[Status.WARN]}  "
         f"UNKNOWN {counts[Status.UNKNOWN]}  PASS {counts[Status.PASS]}[/dim]"
     )
-    raise typer.Exit(code=exit_code(results, fail_on))
+    if comparison is not None:
+        err.print(f"[dim]{comparison_line(comparison)}[/dim]", soft_wrap=True)
+    raise typer.Exit(code=exit_code(results, fail_on, comparison))
+
+
+def _project_scope(run: Scope, names: tuple[str, ...]) -> ProjectScope:
+    return ProjectScope(
+        project_id=run.project_id,
+        clusters=names,
+        policy_profile=run.policy_profile,
+        policy_path=run.policy_path,
+        policy_fingerprint=run.policy_fingerprint,
+        attestations_path=run.attestations_path,
+        generated_at=run.generated_at,
+    )
+
+
+def _render(snapshot: Snapshot, fmt: OutputFormat, comparison: Comparison | None) -> str:
+    if snapshot.project is not None:
+        return render_project(snapshot.reports, snapshot.project, fmt=fmt, comparison=comparison)
+    (report,) = snapshot.reports
+    return render(report.results, report.scope, fmt=fmt, comparison=comparison)
 
 
 def _progress(name: str, state: str) -> None:
@@ -261,19 +316,19 @@ def _progress(name: str, state: str) -> None:
 
 def _score_cluster(
     client: httpx.Client,
-    project_id: str,
     name: str,
     project: ProjectFacts,
     window: SlowQueryWindow | None,
     policy: Policy,
     attestations: Attestations,
-    policy_file: Path | None,
-    attest_file: Path | None,
+    run: Scope,
 ) -> ClusterReport:
     err.print(f"[bold]{name}[/bold]")
-    facts = collect_cluster(client, project_id, name, project, _progress, slow_query_window=window)
+    facts = collect_cluster(
+        client, run.project_id, name, project, _progress, slow_query_window=window
+    )
     results = apply_attestations(evaluate(facts, policy), attestations)
-    return ClusterReport(scope=_scope(facts, policy, policy_file, attest_file), results=results)
+    return ClusterReport(scope=_scope(facts, run), results=results)
 
 
 @app.command()
