@@ -1,7 +1,8 @@
 """Self-contained HTML scorecard for the WAF readiness check. Pure: ``render_html`` -> str.
 
 Three audiences on one page: the pillar cards for the architect, "Action needed" with evidence
-and the Atlas fix for the platform team, and "Discuss these" for the workshop.
+and the Atlas fix for the platform team, and "Discuss these" for the workshop. With a baseline,
+"Changes since baseline" comes first for the operations team: what moved since the last run.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any
 
 from mongoops import __version__
 from mongoops.common.html_theme import BASE_CSS, SAFE_HARBOUR_HTML, TABLE_JS
+from mongoops.waf_check.baseline import Change, CheckChange, Comparison, ScoreChange
 from mongoops.waf_check.catalog import CATALOG_VERSION
 from mongoops.waf_check.model import PILLAR_LABEL, CheckResult, Kind, Pillar, Status
 from mongoops.waf_check.report import (
@@ -25,6 +27,8 @@ from mongoops.waf_check.report import (
     count_by_pillar,
     count_by_status,
     project_results,
+    score_text,
+    signed_delta,
     sort_results,
 )
 from mongoops.waf_check.score import (
@@ -48,6 +52,26 @@ _STATUS_CLASS: Mapping[Status, str] = {
     Status.NA: "muted",
     Status.SKIPPED: "muted",
     Status.DISCUSS: "search",
+}
+
+# Badge colour per movement; red is for regressions only, green for what got better.
+_CHANGE_CLASS: Mapping[Change, str] = {
+    Change.REGRESSED: "bad",
+    Change.NOT_EVALUATED: "warn",
+    Change.NEW_CHECK: "index",
+    Change.IMPROVED: "search",
+    Change.FIXED: "ok",
+    Change.NOW_EVALUATED: "muted",
+    Change.UNCHANGED: "muted",
+}
+# KPI card accent when the count is not zero (a zero regression count is shown as good news).
+_CHANGE_KPI: Mapping[Change, str] = {
+    Change.REGRESSED: "alert",
+    Change.NOT_EVALUATED: "warn",
+    Change.NEW_CHECK: "index",
+    Change.IMPROVED: "good",
+    Change.FIXED: "good",
+    Change.NOW_EVALUATED: "",
 }
 
 _EXTRA_CSS = """
@@ -114,42 +138,66 @@ background:var(--mist);border-radius:8px;padding:4px 10px;white-space:nowrap}
 .scoreline{display:inline-flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
 .scoreline .sv{font-weight:700;font-size:16px}.scoreline .st{font-size:12px;color:var(--grey)}
 td .meter{width:90px;display:inline-grid;vertical-align:middle;margin-left:8px}
+.score-meta .delta{margin:10px 8px 0 0;display:inline-block;padding:5px 12px;border-radius:999px;
+font-size:12px;font-variant-numeric:tabular-nums;border:1px solid rgba(255,255,255,.25);
+background:rgba(255,255,255,.07);color:var(--mist2)}
+.score-meta .delta b{color:#fff}
+.score-meta .delta.up{background:rgba(0,237,100,.2);border-color:var(--green);color:#fff;
+box-shadow:0 0 14px rgba(0,237,100,.35)}
+.score-meta .delta.up b{color:var(--green)}
+.score-meta .delta.down{border-color:rgba(255,105,96,.6)}.score-meta .delta.down b{color:#FF9A94}
+.deltas{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;
+margin-top:12px}
+.dl{font-variant-numeric:tabular-nums;font-weight:700;white-space:nowrap}
+.dl.up{color:var(--ok)}.dl.down{color:var(--bad)}.dl.same,.dl.none{color:var(--grey)}
+.move{white-space:nowrap;font-variant-numeric:tabular-nums}
+.why{color:var(--grey);font-size:12px;margin-left:6px}
+.changes{margin-top:12px}
 @media (max-width:900px){.hero{grid-template-columns:1fr}}
 @media (max-width:560px){.score-card{grid-template-columns:1fr;justify-items:center;
 text-align:center}}
 @media (prefers-reduced-motion:reduce){.ring .arc{transition:none}}
 """
 
-# Count the hero number up from 0 and sweep the ring once the page has painted. The final value
-# is already in the markup (data-score), so the page is correct without JavaScript and for
-# prefers-reduced-motion; the animation is only a reveal.
+# Count the hero number up and sweep the ring once the page has painted: from the baseline score
+# when there is one (data-from / data-from-len), else from 0. The final value is already in the
+# markup (data-score), so the page is correct without JavaScript and for prefers-reduced-motion;
+# the animation is only a reveal.
 SCORE_JS = """
 (function(){
   var nodes=document.querySelectorAll('[data-score]');if(!nodes.length)return;
   var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   Array.prototype.forEach.call(nodes,function(el){
     var target=parseFloat(el.getAttribute('data-score')),v=el.querySelector('.v'),
-        arc=el.parentNode.querySelector('.arc'),len=arc?parseFloat(arc.getAttribute('data-len')):0;
+        arc=el.parentNode.querySelector('.arc'),len=arc?parseFloat(arc.getAttribute('data-len')):0,
+        from=parseFloat(el.getAttribute('data-from'))||0,
+        fromLen=parseFloat(el.getAttribute('data-from-len'))||0;
     function finish(){if(v)v.textContent=target.toFixed(1);
       if(arc)arc.style.strokeDasharray=len+' 1000';}
     if(reduce||isNaN(target)){finish();return;}
+    if(arc&&fromLen){arc.style.transition='none';arc.style.strokeDasharray=fromLen+' 1000';
+      arc.getBoundingClientRect();arc.style.transition='';}
     var t0=null,dur=700;
     requestAnimationFrame(function(){if(arc)arc.style.strokeDasharray=len+' 1000';});
     function step(ts){if(t0===null)t0=ts;var p=Math.min(1,(ts-t0)/dur),e=1-Math.pow(1-p,3);
-      if(v)v.textContent=(target*e).toFixed(1);if(p<1)requestAnimationFrame(step);else finish();}
+      if(v)v.textContent=(from+(target-from)*e).toFixed(1);
+      if(p<1)requestAnimationFrame(step);else finish();}
     requestAnimationFrame(step);
   });
 })();
 """
 
 
-def render_html(results: Sequence[CheckResult], scope: Scope) -> str:
+def render_html(
+    results: Sequence[CheckResult], scope: Scope, comparison: Comparison | None = None
+) -> str:
     generated = scope.resolved_time()
     auto = tuple(r for r in sort_results(results) if r.kind is Kind.AUTO)
     discuss = tuple(r for r in results if r.kind is Kind.DISCUSS)
     body = "\n".join(
         (
-            _hero(results, f"cluster {scope.cluster}"),
+            _hero(results, f"cluster {scope.cluster}", comparison),
+            _comparison_section(comparison, per_cluster=False),
             _kpis(results),
             _pillars(results),
             _action_section(results),
@@ -167,6 +215,7 @@ def render_html(results: Sequence[CheckResult], scope: Scope) -> str:
         ("policy", scope.policy_profile),
         ("policy file", scope.policy_path),
         ("attestations", scope.attestations_path),
+        ("baseline", comparison.baseline_generated_at if comparison else ""),
         ("generated", generated),
     )
     return _page(
@@ -174,7 +223,9 @@ def render_html(results: Sequence[CheckResult], scope: Scope) -> str:
     )
 
 
-def render_project_html(reports: Sequence[ClusterReport], scope: ProjectScope) -> str:
+def render_project_html(
+    reports: Sequence[ClusterReport], scope: ProjectScope, comparison: Comparison | None = None
+) -> str:
     """One page for a whole project: roll-up first, then every cluster's scorecard, then the
     discussion items once."""
     generated = scope.resolved_time()
@@ -182,7 +233,8 @@ def render_project_html(reports: Sequence[ClusterReport], scope: ProjectScope) -
     discuss = tuple(r for r in everything if r.kind is Kind.DISCUSS)
     body = "\n".join(
         (
-            _hero(everything, f"project {scope.project_id}"),
+            _hero(everything, f"project {scope.project_id}", comparison),
+            _comparison_section(comparison, per_cluster=True),
             _kpis(everything),
             _rollup(reports),
             _project_actions(reports),
@@ -196,6 +248,7 @@ def render_project_html(reports: Sequence[ClusterReport], scope: ProjectScope) -
         ("policy", scope.policy_profile),
         ("policy file", scope.policy_path),
         ("attestations", scope.attestations_path),
+        ("baseline", comparison.baseline_generated_at if comparison else ""),
         ("generated", generated),
     )
     return _page(
@@ -242,14 +295,25 @@ MongoDB Atlas operational readiness checklist</a>.{SAFE_HARBOUR_HTML}</footer>
 """
 
 
-def _hero(results: Sequence[CheckResult], what: str) -> str:
-    """Score ring, tier, arithmetic, distance to the next tier, and the quick wins."""
+def _arc_len(value: float | None) -> float:
+    return _RING_LEN * (value / MAX_SCORE) if value is not None else 0.0
+
+
+def _hero(results: Sequence[CheckResult], what: str, comparison: Comparison | None = None) -> str:
+    """Score ring, tier, arithmetic, change since the baseline, distance to the next tier, and
+    the quick wins."""
     s = score(results)
     tier = s.tier
     css = f"tier-{tier.css}" if tier else "tier-none"
     value = s.value
     shown = f"{value:.1f}" if value is not None else "-"
-    arc_len = _RING_LEN * (value / MAX_SCORE) if value is not None else 0.0
+    arc_len = _arc_len(value)
+    before = comparison.total.before.value if comparison and comparison.total.before else None
+    from_attrs = (
+        f' data-from="{before:.1f}" data-from-len="{_arc_len(before):.1f}"'
+        if before is not None
+        else ""
+    )
     arith = (
         f"{s.earned} of {s.possible} points &middot; {s.passed} of {s.scored} scored checks pass"
         if value is not None
@@ -278,15 +342,34 @@ def _hero(results: Sequence[CheckResult], what: str) -> str:
         f'<div class="ring"><svg viewBox="0 0 120 120" aria-hidden="true">'
         f'<circle class="track" cx="60" cy="60" r="{_RING_RADIUS}"/>'
         f'<circle class="arc" cx="60" cy="60" r="{_RING_RADIUS}" data-len="{arc_len:.1f}"/></svg>'
-        f'<div class="num" data-score="{shown}" role="img" '
+        f'<div class="num" data-score="{shown}"{from_attrs} role="img" '
         f'aria-label="readiness score {shown} out of 10">'
         f'<span class="v">{shown}</span><span class="of">out of 10</span></div></div>'
         f'<div class="score-meta"><div class="ctx">Readiness score &middot; {escape(what)}</div>'
         f'<div class="tier">{escape(tier.label) if tier else "Not scoreable"}</div>'
-        f'<div class="arith">{arith}</div>{next_html}<div class="tiers">{tiers}</div></div></div>'
-        + _wins(results, s)
-        + "</section>"
+        f'<div class="arith">{arith}</div>{_delta_pill(comparison)}{next_html}'
+        f'<div class="tiers">{tiers}</div></div></div>' + _wins(results, s) + "</section>"
     )
+
+
+def _delta_pill(comparison: Comparison | None) -> str:
+    """``+0.8 since baseline (5.3, Needs work, 2026-09-01 ...)``. Direction is in the text (sign
+    and words), not only the colour; only a gain gets the glow."""
+    if comparison is None:
+        return ""
+    total = comparison.total
+    was = total.before
+    tier = was.tier if was else None
+    context = escape(
+        f"{score_text(was)}{f', {tier.label}' if tier else ''}, {comparison.baseline_generated_at}"
+    )
+    if total.direction == "same":
+        text = "<b>No change</b> since baseline"
+    elif total.direction == "none":
+        text = "<b>n/a</b> since baseline (one side not scoreable)"
+    else:
+        text = f"<b>{signed_delta(total.delta)}</b> since baseline"
+    return f'<div class="delta {total.direction}">{text} ({context})</div>'
 
 
 def _wins(results: Sequence[CheckResult], total: Score) -> str:
@@ -426,6 +509,111 @@ def _kpis(results: Sequence[CheckResult]) -> str:
         for label, n, cls in cards
     )
     return f'<section><h2>At a glance</h2><div class="kpis">{html}</div></section>'
+
+
+def _comparison_section(c: Comparison | None, *, per_cluster: bool) -> str:
+    """Movement counts, score before / after per pillar (and cluster), then every change."""
+    if c is None:
+        return ""
+    kpis = "".join(
+        f'<div class="kpi {_change_kpi(kind, n)}">'
+        f'<div class="v">{n}</div><div class="l">{escape(kind.label.lower())}</div></div>'
+        for kind, n in c.tally()
+    )
+    notes = (
+        '<div class="todo changes"><div class="card warn"><h3>Not like for like</h3><ul>'
+        + "".join(f"<li>{escape(note)}</li>" for note in c.notes)
+        + "</ul></div></div>"
+        if c.notes
+        else ""
+    )
+    pillars = _score_table("pillar", tuple((PILLAR_LABEL[p], s) for p, s in c.by_pillar.items()))
+    clusters = (
+        _score_table(
+            "cluster",
+            tuple((name + _cluster_suffix(c, name), s) for name, s in c.by_cluster.items()),
+        )
+        if per_cluster
+        else ""
+    )
+    changes = (
+        _changes_table(c.changes, per_cluster=per_cluster)
+        if c.changes
+        else '<div class="todo changes"><div class="card ok">No check changed status since the '
+        "baseline.</div></div>"
+    )
+    return (
+        f'<section id="changes"><h2>Changes since baseline ({len(c.changes)})</h2>'
+        f'<div class="kpis">{kpis}</div>'
+        f'<div class="note">Compared with <code>{escape(c.baseline_path)}</code> generated '
+        f"{escape(c.baseline_generated_at)} (sha256 <code>{escape(c.baseline_sha256[:12])}</code>)"
+        f"; {c.unchanged} check(s) unchanged. <b>Regressed</b>: a new FAIL / WARN, or WARN to "
+        "FAIL. <b>No longer evaluated</b>: scored in the baseline, now UNKNOWN, NA, off or open; "
+        "never counted as fixed.</div>"
+        f'{notes}<div class="deltas">{pillars}{clusters}</div>{changes}</section>'
+    )
+
+
+def _change_kpi(kind: Change, n: int) -> str:
+    """Accent for a movement card; zero regressions is good news, other zeros stay neutral."""
+    if n:
+        return _CHANGE_KPI[kind]
+    return "good" if kind is Change.REGRESSED else ""
+
+
+def _cluster_suffix(c: Comparison, name: str) -> str:
+    if name in c.clusters_added:
+        return " (new)"
+    if name in c.clusters_removed:
+        return " (not in this run)"
+    return ""
+
+
+def _score_table(label: str, rows: Sequence[tuple[str, ScoreChange]]) -> str:
+    body = "".join(
+        f"<tr><td>{escape(name)}</td><td class=num>{score_text(s.before)}</td>"
+        f"<td class=num>{score_text(s.after)}</td>"
+        f'<td class=num><span class="dl {s.direction}">{signed_delta(s.delta)}</span></td></tr>'
+        for name, s in rows
+    )
+    return (
+        f"<table><thead><tr><th>{escape(label)}</th><th class=num>baseline</th>"
+        f"<th class=num>now</th><th class=num>change</th></tr></thead><tbody>{body}</tbody></table>"
+    )
+
+
+def _changes_table(changes: Sequence[CheckChange], *, per_cluster: bool) -> str:
+    head = "".join(
+        f"<th>{h}</th>"
+        for h in ("change", *(("cluster",) if per_cluster else ()), "id", "check", "status", "now")
+    )
+    rows = "".join(
+        "<tr>"
+        f'<td class="nowrap"><span class="badge {_CHANGE_CLASS[ch.change]}">'
+        f"{escape(ch.change.label)}</span>"
+        f"{f'<span class=why>{escape(ch.reason)}</span>' if ch.reason else ''}</td>"
+        + (
+            (
+                f'<td class="nowrap"><code>{escape(ch.cluster)}</code></td>'
+                if ch.cluster
+                else "<td>project</td>"
+            )
+            if per_cluster
+            else ""
+        )
+        + f'<td class="nowrap"><code>{escape(ch.result.id)}</code></td>'
+        f"<td>{escape(ch.result.title)}</td>"
+        f'<td class="move">{_status_cell(ch.before, "not in baseline")} &rarr; '
+        f"{_status_cell(ch.after, 'not in this run')}</td>"
+        f"<td>{escape(ch.result.message + attested_by(ch.result))}</td>"
+        "</tr>"
+        for ch in changes
+    )
+    return f'<table class="changes"><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>'
+
+
+def _status_cell(status: Status | None, missing: str) -> str:
+    return _badge(status) if status is not None else f'<span class="why">{missing}</span>'
 
 
 def _pillars(results: Sequence[CheckResult]) -> str:

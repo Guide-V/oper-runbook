@@ -328,6 +328,94 @@ def test_attest_init_then_attested_run_gates(tmp_path: Path) -> None:
     assert broken.exit_code == 2 and "not a discussion item" in broken.output
 
 
+def test_baseline_comparison_and_regression_gate(tmp_path: Path) -> None:
+    """Golden path: a run leaves --json, the next run compares with it and gates on regressions."""
+    base = tmp_path / "base.json"
+    atlas = ["waf-check", "atlas", "-p", GID, "-c", "prod-orders"]
+    first = runner.invoke(app, [*atlas, "--json", str(base)])
+    assert first.exit_code == 0, first.output
+    assert "WAF readiness for cluster prod-orders" in first.stdout  # table still on stdout
+    assert json.loads(base.read_text())["framework"] == "atlas-well-architected"
+
+    same = runner.invoke(app, [*atlas, "--baseline", str(base), "--fail-on", "regression"])
+    assert same.exit_code == 0, same.output
+    assert "no status changes" in same.output
+
+    strict = tmp_path / "strict.yaml"
+    strict.write_text("profile: strict\nchecks:\n  rel.ha.regions: fail\nha: {min_regions: 2}\n")
+    html = tmp_path / "r.html"
+    gated = runner.invoke(
+        app,
+        [
+            *atlas,
+            "--policy",
+            str(strict),
+            "--baseline",
+            str(base),
+            "--fail-on",
+            "regression",
+            "-f",
+            "json",
+            "--html",
+            str(html),
+        ],
+    )
+    assert gated.exit_code == 1, gated.output
+    comparison = json.loads(gated.stdout)["comparison"]
+    assert comparison["counts"]["regressed"] == 1
+    (change,) = comparison["changes"]
+    assert (change["id"], change["before"], change["after"]) == ("rel.ha.regions", "PASS", "FAIL")
+    assert "policy profile changed from mongodb-defaults to strict" in comparison["notes"][0]
+    assert comparison["baseline"]["path"] == str(base)
+    assert "Since baseline" in gated.output  # stderr summary line
+    page = html.read_text()
+    assert "Changes since baseline (1)" in page and "rel.ha.regions" in page
+
+
+def test_project_baseline_round_trip(tmp_path: Path) -> None:
+    base = tmp_path / "project.json"
+    project = ["waf-check", "atlas", "-p", GID, "--all-clusters"]
+    first = runner.invoke(app, [*project, "--json", str(base)])
+    assert first.exit_code == 0, first.output
+    again = runner.invoke(app, [*project, "--baseline", str(base), "-f", "json"])
+    assert again.exit_code == 0, again.output
+    comparison = json.loads(again.stdout)["comparison"]
+    assert comparison["changes"] == [] and comparison["score"]["delta"] == 0.0
+    assert list(comparison["by_cluster"]) == ["dev-scratch", "prod-orders"]
+    single = runner.invoke(app, ["waf-check", "atlas", "-p", GID, "-c", "dev-scratch",
+                                 "--baseline", str(base), "-f", "json"])  # fmt: skip
+    assert single.exit_code == 0, single.output
+    assert list(json.loads(single.stdout)["comparison"]["by_cluster"]) == ["dev-scratch"]
+
+
+def test_baseline_usage_errors_stop_before_any_api_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path / "base.json"
+    made = runner.invoke(
+        app, ["waf-check", "atlas", "-p", GID, "-c", "prod-orders", "--json", str(base)]
+    )
+    assert made.exit_code == 0, made.output
+
+    def no_api(_base_url: str) -> httpx.Client:
+        raise AssertionError("no API call expected")
+
+    monkeypatch.setattr(waf_cli, "_open_client", no_api)
+    atlas = ["waf-check", "atlas", "-p", GID]
+    cases = (
+        ([*atlas, "-c", "prod-orders", "--fail-on", "regression"], "needs --baseline"),
+        ([*atlas, "-c", "prod-orders", "--baseline", str(tmp_path / "nope.json")], "not found"),
+        ([*atlas, "-c", "dev-scratch", "--baseline", str(base)], "has no cluster dev-scratch"),
+        ([*atlas, "--all-clusters", "--baseline", str(base)], "--all-clusters baseline"),
+        (["waf-check", "atlas", "-p", "other", "-c", "prod-orders", "--baseline", str(base)],
+         "this run is for project other"),
+    )  # fmt: skip
+    for argv, fragment in cases:
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 2, (argv, result.output)
+        assert fragment in " ".join(result.output.split()), (argv, result.output)  # rich wraps
+
+
 def test_checks_lists_catalog() -> None:
     result = runner.invoke(app, ["waf-check", "checks", "-f", "json"])
     ids = {c["id"] for c in json.loads(result.stdout)}

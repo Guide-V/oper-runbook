@@ -69,23 +69,30 @@ probe-local:
 	  --html "$(REPORT)" $(ARGS)
 	@$(link_latest)
 
-# WAF readiness scorecard for one cluster (read-only Admin API calls).
+# WAF readiness scorecard for one cluster (read-only Admin API calls). Writes HTML and JSON; the
+# JSON is what a later run takes as BASELINE.
 #   make probe-waf ATLAS_CLUSTER=Cluster0
 #   make probe-waf ATLAS_CLUSTER=Cluster0 POLICY=landing-zone.prod.yaml ARGS="--fail-on fail"
 #   make probe-waf-project ATTEST=attestations.yaml          (every cluster in the project)
+#   make probe-waf-project BASELINE=reports/probe-waf-project-latest.json   (vs the previous run)
+#   make probe-waf-project BASELINE=waf-baseline.json ARGS="--fail-on regression"
 POLICY ?=
 ATTEST ?=
+BASELINE ?=
 POLICY_FLAG = $(if $(POLICY),--policy "$(POLICY)",)
 ATTEST_FLAG = $(if $(ATTEST),--attest "$(ATTEST)",)
+BASELINE_FLAG = $(if $(BASELINE),--baseline "$(BASELINE)",)
+WAF_FLAGS = $(POLICY_FLAG) $(ATTEST_FLAG) $(BASELINE_FLAG) \
+  --html "$(REPORT)" --json "$(REPORT_DIR)/$@-$(STAMP).json" $(ARGS)
+# The -latest links follow any run that wrote a report, including one a --fail-on gate exits 1
+# on; a usage error writes nothing and leaves them (and so a BASELINE pointing at one) alone.
+waf_run = $(1); rc=$$?; for x in html json; do f="$@-$(STAMP).$$x"; \
+  [ -f "$(REPORT_DIR)/$$f" ] && ln -sf "$$f" "$(REPORT_DIR)/$@-latest.$$x"; done; exit $$rc
 probe-waf:
-	$(BIN)/mongoops waf-check atlas -c "$(ATLAS_CLUSTER)" $(POLICY_FLAG) $(ATTEST_FLAG) \
-	  --html "$(REPORT)" $(ARGS)
-	@$(link_latest)
+	$(call waf_run,$(BIN)/mongoops waf-check atlas -c "$(ATLAS_CLUSTER)" $(WAF_FLAGS))
 
 probe-waf-project:
-	$(BIN)/mongoops waf-check atlas --all-clusters $(POLICY_FLAG) $(ATTEST_FLAG) \
-	  --html "$(REPORT)" $(ARGS)
-	@$(link_latest)
+	$(call waf_run,$(BIN)/mongoops waf-check atlas --all-clusters $(WAF_FLAGS))
 
 lint:
 	$(BIN)/ruff format --check src tests

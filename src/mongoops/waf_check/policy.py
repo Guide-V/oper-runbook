@@ -11,8 +11,10 @@ already knows which environment it is scoring.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +100,13 @@ class Policy:
 
 
 DEFAULT_POLICY = Policy()
+
+
+def policy_fingerprint(policy: Policy) -> str:
+    """12 hex characters identifying the effective policy (values and severities, not the file's
+    comments or layout), so a baseline comparison can tell that the rules changed. Pure."""
+    canonical = json.dumps(asdict(policy), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
 
 
 # --- loading ------------------------------------------------------------------------------------

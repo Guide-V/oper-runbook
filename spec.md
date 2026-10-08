@@ -439,3 +439,106 @@ regex-finder README section and will be composed in later.
 * Alert metric names are matched exactly; if Atlas renames one, the default list shows it as
   missing. The policy file is the fix, and the evidence names the exact string.
 * Peering is looked up for the cluster's provider only (multi-cloud clusters: first provider).
+
+## 2026-09-26: baseline comparison for `waf-check`
+
+### Goal
+
+Asked from the operations team's side what would make the scorecard more useful, the top
+answer was comparing a run with an earlier one. A single score does not say whether the
+workshop's actions landed or whether someone changed a setting since, and a gate on absolute
+findings fails every pipeline of an environment that has known, accepted gaps. The customer
+also asked for a PDF of the comparison as an audit artifact, then deferred it (decision 46);
+the HTML report and the comparison are the scope.
+
+### Decisions
+
+40. **The baseline is an earlier JSON report, read back into the same types.** No new file
+    format and no state store: `--baseline FILE` takes what `-f json` or the new `--json FILE`
+    wrote. `baseline.py` rebuilds `CheckResult`s and `ClusterReport`s from it (auto checks
+    re-sorted into catalog order, discussion items attached to every cluster as in a live run),
+    so the score, the renderers and the comparison run the same code on both sides. A test
+    holds the round trip exact: rendering the JSON read back gives byte-identical JSON and HTML
+    for a cluster run, an attested run and a project run. `--json` exists because a run that
+    renders a table or HTML should still leave the next run's baseline behind; every output of
+    one run shares one `generated_at`.
+
+41. **Seven change kinds, chosen so the delta cannot be gamed or faked.** Checks are paired by
+    (cluster, check id):
+    * *Regressed*: a `FAIL` / `WARN` the baseline did not have (`new finding`), `WARN` to `FAIL`
+      (`worse`), or any finding on a cluster not in the baseline (`new cluster`). A finding the
+      baseline could not see (`UNKNOWN` there) is also a regression: the gate cannot tell a new
+      gap from a newly visible one, and both need someone to look.
+    * *No longer evaluated*: scored before, now `UNKNOWN`, `NA`, `SKIPPED`, open `DISCUSS`, or
+      missing. Switching a check `off`, losing an API role or letting an attestation expire
+      removes a finding from the report; counting that as *Fixed* would reward the wrong thing.
+      Listed, not gated.
+    * *New check*: the id is nowhere in the baseline (a newer catalog). Upgrading the tool must
+      not break a pipeline, so it is listed and never gated.
+    * *Improved* (`FAIL` to `WARN`), *Fixed* (finding to `PASS`), *Now evaluated* (not scored
+      before, `PASS` now), and *Unchanged* (counted only).
+    * Clusters that disappeared are listed as not in this run and not classified: deleting a
+      cluster is not a fix of its findings.
+
+42. **Deltas come with the reasons they may not be like for like.** Score deltas are computed
+    overall, per pillar and per cluster from the two runs' own scores. When the catalog
+    version, the policy profile, or the policy itself changed between runs, a note says so
+    (HTML "Not like for like" card, table, JSON `notes`). To detect a policy edit under the same
+    profile name, every report now carries `scope.policy_fingerprint`: 12 hex characters of
+    SHA-256 over the canonical JSON of the effective policy, so comments and key order do not
+    count as a change. Baselines written before the fingerprint existed simply get no note.
+
+43. **The baseline must cover the run, checked before any API call.** Same project id; a `-c`
+    run takes that cluster's report or a project report containing it (narrowed to it); an
+    `--all-clusters` run needs an `--all-clusters` baseline. Anything else is exit 2 with a
+    message naming both sides, before credentials are used. `--fail-on regression` without
+    `--baseline` is a usage error too. The output records the baseline's path, `generated_at`
+    and SHA-256 so an auditor can tell exactly which file the comparison used.
+
+44. **`--fail-on regression`: gate on drift, not on history.** Exit 1 only when a check
+    regressed. This is the gate for an environment with accepted gaps: it passes until a change
+    makes something worse. The existing `fail` / `warn` gates are unchanged and ignore the
+    baseline.
+
+45. **HTML: the comparison follows the score, and the ring counts from the baseline.** Placed
+    right after the hero and before "At a glance", because "what changed" is the first question
+    on a re-run. Per the gamified-calculator-ui rules: the ring and number animate from the
+    baseline score (`data-from`) to today's, a gain gets the Spring Green glow and a loss a plain
+    red pill, the direction is in words ("-0.4 since baseline") as well as colour, zero
+    regressions is shown as good rather than neutral, and `prefers-reduced-motion` still skips
+    the animation. The table prints one "Since baseline" line plus the changed checks; the
+    same line goes to stderr for every format so pipeline logs carry it. Verified in headless
+    Chrome on fixture runs with regressions, fixes, a lost API role, and an added and a
+    removed cluster; the only wording fix it prompted was "not in baseline" vs "not in this run"
+    on the before / after side of a row.
+    * Rejected: an offline `waf-check compare OLD.json NEW.json`. Useful, but every comparison
+      the team needs can be produced by the live run, and it would be a second entry point to
+      document and test. Easy to add later since `compare` is pure and both of its inputs can
+      be read from JSON.
+
+46. **PDF export deferred.** The customer asked for a PDF of the comparison to send as an audit
+    artifact. The proposal was WeasyPrint rendering the same HTML with print CSS. It needs
+    Pango as a system library, which was not installed on the development machine and is not in
+    a plain Python CI image, and the choice of engine and page layout was left open when the
+    customer deferred. Until then the self-contained HTML is the artifact: it carries the baseline's
+    SHA-256, both timestamps and the safe-harbour line, and a browser's "Save as PDF" prints it.
+
+47. **Makefile and `.gitignore`.** `probe-waf` / `probe-waf-project` now write a dated JSON next
+    to the HTML and take `BASELINE=`. The `-latest.{html,json}` links move after any run that
+    wrote a report, including one a `--fail-on` gate exits 1 on (the report is what the team
+    opens next), but not after a usage error, which writes nothing, so a `BASELINE` pointing at
+    a `-latest` link never dangles. Baseline JSON names a real project, its clusters and their
+    findings, and the repo is public (decision 20), so `*baseline*.json`, `waf-*.json`,
+    `waf-*.html` and `*.pdf` are ignored on top of `reports/`.
+
+### Known limitations / follow-ups
+
+* PDF export (decision 46).
+* A renamed cluster shows as a removed cluster plus a new cluster whose findings are
+  regressions; there is no rename detection.
+* The project score delta pools whatever clusters each run had, so adding or removing a
+  cluster moves it; the per-cluster score table shows where the change came from.
+* One baseline per run. A trend over many runs (score history chart) would need a directory of
+  reports and is not built.
+* A baseline from a different catalog compares only the checks both know; a check removed from
+  the catalog is reported as no longer evaluated.

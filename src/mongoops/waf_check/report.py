@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from rich.console import Console
 from rich.table import Table
@@ -23,9 +23,19 @@ from mongoops.waf_check.model import (
 )
 from mongoops.waf_check.score import Score, score, score_by_pillar
 
+if TYPE_CHECKING:  # baseline imports this module; the renderers only read Comparison attributes
+    from mongoops.waf_check.baseline import Comparison
+
 OutputFormat = Literal["table", "json", "html"]
 
+FRAMEWORK = "atlas-well-architected"
+"""``framework`` key of every JSON report; ``--baseline`` refuses files without it."""
+
 ACTION_STATUSES = (Status.FAIL, Status.WARN)
+
+
+def now_utc() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +49,12 @@ class Scope:
     version: str = ""
     policy_profile: str = ""
     policy_path: str = ""
+    policy_fingerprint: str = ""
     attestations_path: str = ""
     generated_at: str = ""
 
     def resolved_time(self) -> str:
-        return self.generated_at or datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return self.generated_at or now_utc()
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,11 +73,12 @@ class ProjectScope:
     clusters: tuple[str, ...] = ()
     policy_profile: str = ""
     policy_path: str = ""
+    policy_fingerprint: str = ""
     attestations_path: str = ""
     generated_at: str = ""
 
     def resolved_time(self) -> str:
-        return self.generated_at or datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return self.generated_at or now_utc()
 
 
 def project_results(reports: Sequence[ClusterReport]) -> tuple[CheckResult, ...]:
@@ -96,27 +108,40 @@ def count_by_pillar(results: Sequence[CheckResult]) -> dict[str, dict[str, int]]
     }
 
 
-def render(results: Sequence[CheckResult], scope: Scope, *, fmt: OutputFormat) -> str:
+def render(
+    results: Sequence[CheckResult],
+    scope: Scope,
+    *,
+    fmt: OutputFormat,
+    comparison: Comparison | None = None,
+) -> str:
     if fmt == "json":
-        return render_json(results, scope)
+        return render_json(results, scope, comparison)
     if fmt == "html":
         from mongoops.waf_check.html_report import render_html  # keep the import graph lazy
 
-        return render_html(results, scope)
-    return render_table(results, scope)
+        return render_html(results, scope, comparison)
+    return render_table(results, scope, comparison)
 
 
-def render_json(results: Sequence[CheckResult], scope: Scope) -> str:
+def render_json(
+    results: Sequence[CheckResult], scope: Scope, comparison: Comparison | None = None
+) -> str:
     return json.dumps(
         {
-            "framework": "atlas-well-architected",
+            "framework": FRAMEWORK,
             "catalog": CATALOG_VERSION,
             **json_payload(results, scope),
+            **_comparison_payload(comparison),
         },
         indent=2,
         ensure_ascii=False,
         default=_jsonable,
     )
+
+
+def _comparison_payload(comparison: Comparison | None) -> dict[str, Any]:
+    return {"comparison": comparison.to_dict()} if comparison else {}
 
 
 def json_payload(
@@ -137,23 +162,29 @@ def json_payload(
 
 
 def render_project(
-    reports: Sequence[ClusterReport], scope: ProjectScope, *, fmt: OutputFormat
+    reports: Sequence[ClusterReport],
+    scope: ProjectScope,
+    *,
+    fmt: OutputFormat,
+    comparison: Comparison | None = None,
 ) -> str:
     if fmt == "json":
-        return render_project_json(reports, scope)
+        return render_project_json(reports, scope, comparison)
     if fmt == "html":
         from mongoops.waf_check.html_report import render_project_html
 
-        return render_project_html(reports, scope)
-    return render_project_table(reports, scope)
+        return render_project_html(reports, scope, comparison)
+    return render_project_table(reports, scope, comparison)
 
 
-def render_project_json(reports: Sequence[ClusterReport], scope: ProjectScope) -> str:
+def render_project_json(
+    reports: Sequence[ClusterReport], scope: ProjectScope, comparison: Comparison | None = None
+) -> str:
     """Project roll-up plus one per-cluster payload each (same shape as the single-cluster JSON
     minus ``discuss``, which appears once at the top level)."""
     everything = project_results(reports)
     payload: dict[str, Any] = {
-        "framework": "atlas-well-architected",
+        "framework": FRAMEWORK,
         "catalog": CATALOG_VERSION,
         "scope": {**asdict(scope), "generated_at": scope.resolved_time()},
         "summary": {
@@ -172,6 +203,7 @@ def render_project_json(reports: Sequence[ClusterReport], scope: ProjectScope) -
             json_payload(rep.results, rep.scope, include_discuss=False) for rep in reports
         ],
         "discuss": [discuss_entry(r) for r in everything if r.kind is Kind.DISCUSS],
+        **_comparison_payload(comparison),
     }
     return json.dumps(payload, indent=2, ensure_ascii=False, default=_jsonable)
 
@@ -195,7 +227,62 @@ def score_line(s: Score) -> str:
     )
 
 
-def render_project_table(reports: Sequence[ClusterReport], scope: ProjectScope) -> str:
+def signed_delta(delta: float | None) -> str:
+    """``+0.8`` / ``-1.2`` / ``0.0``, or ``n/a`` when either side could not be scored. Pure."""
+    if delta is None:
+        return "n/a"
+    return f"{delta:+.1f}" if delta else "0.0"
+
+
+def score_text(s: Score | None) -> str:
+    return f"{s.value:.1f}" if s is not None and s.value is not None else "-"
+
+
+def comparison_line(c: Comparison) -> str:
+    """``Since baseline 2026-09-01 03:00:00 UTC: score 5.3 -> 6.1 (+0.8); regressed 1, fixed 3``"""
+    moved = ", ".join(f"{ch.label.lower()} {n}" for ch, n in c.tally() if n)
+    return (
+        f"Since baseline {c.baseline_generated_at}: score {score_text(c.total.before)} -> "
+        f"{score_text(c.total.after)} ({signed_delta(c.total.delta)}); "
+        f"{moved or 'no status changes'}"
+    )
+
+
+def _print_comparison(console: Console, c: Comparison | None, *, per_cluster: bool) -> None:
+    if c is None:
+        return
+    console.print(comparison_line(c))
+    for note in c.notes:
+        console.print(f"Note: {note}")
+    if c.clusters_added or c.clusters_removed:
+        console.print(
+            f"Clusters added: {', '.join(c.clusters_added) or 'none'}; "
+            f"not in this run: {', '.join(c.clusters_removed) or 'none'}"
+        )
+    if c.changes:
+        console.print(_changes_table(c, per_cluster=per_cluster))
+
+
+def _changes_table(c: Comparison, *, per_cluster: bool) -> Table:
+    t = Table(title=f"Changes since baseline ({len(c.changes)})", show_lines=False)
+    cols = ("change", *(("cluster",) if per_cluster else ()), "id", "before", "after", "finding")
+    for col in cols:
+        t.add_column(col, overflow="fold")
+    for ch in c.changes:
+        t.add_row(
+            ch.change.label + (f" ({ch.reason})" if ch.reason else ""),
+            *((ch.cluster or "project",) if per_cluster else ()),
+            ch.result.id,
+            ch.before.value if ch.before else "not in baseline",
+            ch.after.value if ch.after else "not in this run",
+            ch.result.message,
+        )
+    return t
+
+
+def render_project_table(
+    reports: Sequence[ClusterReport], scope: ProjectScope, comparison: Comparison | None = None
+) -> str:
     console = Console(record=True, width=200, file=io.StringIO(), force_terminal=False)
     everything = project_results(reports)
     counts = count_by_status(everything)
@@ -210,6 +297,7 @@ def render_project_table(reports: Sequence[ClusterReport], scope: ProjectScope) 
             for s in (Status.FAIL, Status.WARN, Status.UNKNOWN, Status.PASS, Status.NA)
         )
     )
+    _print_comparison(console, comparison, per_cluster=True)
     console.print(_rollup_table(reports))
     actions = cluster_actions(reports)
     if actions:
@@ -292,7 +380,9 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def render_table(results: Sequence[CheckResult], scope: Scope) -> str:
+def render_table(
+    results: Sequence[CheckResult], scope: Scope, comparison: Comparison | None = None
+) -> str:
     console = Console(record=True, width=200, file=io.StringIO(), force_terminal=False)
     counts = count_by_status(results)
     console.print(
@@ -314,6 +404,7 @@ def render_table(results: Sequence[CheckResult], scope: Scope) -> str:
             )
         )
     )
+    _print_comparison(console, comparison, per_cluster=False)
     console.print(_checks_table(tuple(r for r in sort_results(results) if r.kind is Kind.AUTO)))
     discuss = tuple(r for r in results if r.kind is Kind.DISCUSS)
     if discuss:
