@@ -411,7 +411,8 @@ performance:
   require_disk_autoscaling: {y(policy.performance_require_disk_autoscaling)}
   max_suggested_indexes: {policy.performance_max_suggested_indexes}
   # regex-finder remedies that make perf.regex.index-hostile not pass (needs --slow-queries-since):
-  # search, fix_filter, btree_index, collation_index, reversed_field, rewrite, monitor
+  # search, fix_filter, btree_index, collation_index, normalized_field, reversed_field, rewrite,
+  # monitor
   regex_block_on: [{", ".join(policy.performance_regex_block_on)}]
   require_default_max_time_ms: {y(policy.performance_require_default_max_time_ms)}
 

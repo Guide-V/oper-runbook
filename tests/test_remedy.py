@@ -58,19 +58,33 @@ class TestRules:
         assert rec(C.NEGATED, "^S", command="aggregate") is Remedy.REWRITE
         assert rec(C.NEGATED, "^S", command="update", **TINY) is Remedy.REWRITE
 
-    def test_case_insensitive_prefix_is_a_collation_index_even_on_writes(self) -> None:
-        assert rec(C.CASE_INSENSITIVE, "^som", options="i") is Remedy.COLLATION_INDEX
+    def test_case_insensitive_prefix_is_a_lower_cased_field_even_on_writes(self) -> None:
+        # $regex is not collation-aware, so a collation index cannot serve /^som/i
+        assert rec(C.CASE_INSENSITIVE, "^som", options="i") is Remedy.NORMALIZED_FIELD
         assert (
-            rec(C.CASE_INSENSITIVE, "^som", options="i", command="update") is Remedy.COLLATION_INDEX
+            rec(C.CASE_INSENSITIVE, "^Som", options="i", command="update")
+            is Remedy.NORMALIZED_FIELD
         )
         how = recommend(
             category=C.CASE_INSENSITIVE,
             command="find",
-            pattern="^som",
+            pattern="^Som",
             options="i",
             **HEAVY,  # type: ignore[arg-type]
         ).how
-        assert "strength: 2" in how and "^som" in how
+        assert "<field>_lower: /^som/" in how and "collation" in how
+
+    def test_case_insensitive_exact_match_is_an_equality_with_collation(self) -> None:
+        assert rec(C.CASE_INSENSITIVE, "^somchai$", options="i") is Remedy.COLLATION_INDEX
+        assert rec(C.CASE_INSENSITIVE, "^som.*$", options="i") is Remedy.NORMALIZED_FIELD
+        how = recommend(
+            category=C.CASE_INSENSITIVE,
+            command="find",
+            pattern="^somchai$",
+            options="i",
+            **HEAVY,  # type: ignore[arg-type]
+        ).how
+        assert '"somchai"' in how and "strength: 2" in how
 
     def test_case_insensitive_unanchored_goes_to_search_when_heavy(self) -> None:
         assert rec(C.CASE_INSENSITIVE, "example", options="i") is Remedy.SEARCH
@@ -101,7 +115,7 @@ class TestRules:
         for cmd in ("update", "delete", "remove", "findAndModify"):
             assert rec(C.UNANCHORED, r"user\d+@example\.net$", command=cmd) is Remedy.FIX_FILTER
         assert (
-            "$search cannot be used in a update filter"
+            "$search cannot be used in an update filter"
             in recommend(
                 category=C.UNANCHORED,
                 command="update",
@@ -134,9 +148,11 @@ class TestRules:
                 category=cat, command="find", pattern=pattern, options=options, **HEAVY
             ).how  # type: ignore[arg-type]
 
-        assert "wildcard/regex operator" in how(C.LEADING_WILDCARD, "^.*smith$")
-        assert "standard analyzer" in how(C.UNANCHORED, "Rakdee 1234")
-        assert "text or phrase operator" in how(C.UNANCHORED, "Rakdee")
+        assert "the wildcard operator over a keyword" in how(C.LEADING_WILDCARD, "^.*smith$")
+        assert "the regex operator over a keyword" in how(C.UNANCHORED, r"user\d+$")
+        assert "the phrase operator with the standard" in how(C.UNANCHORED, "Rakdee 1234")
+        assert "the text operator with the standard" in how(C.UNANCHORED, "Rakdee")
+        assert "the text operator" in how(C.CASE_INSENSITIVE, "rakdee 1234", "i")
         assert "$search as the first aggregation stage" in how(C.UNANCHORED, "Rakdee")
 
     def test_expression_operator_outside_a_filter_has_no_index_implication(self) -> None:
@@ -162,7 +178,7 @@ class TestRules:
             **HEAVY,  # type: ignore[arg-type]
         )
         assert r.remedy is Remedy.REWRITE
-        assert "/^som/i" in r.how and "collation index" in r.how
+        assert "<field>_lower: /^som/" in r.how and "lower-cased copy" in r.how
 
     def test_expression_operator_in_expr_unanchored_falls_through_to_search(self) -> None:
         assert (
@@ -188,7 +204,7 @@ class TestEndToEnd:
         )
         by = {(f.field, f.pattern, f.command): f.remedy for f in findings}
         assert by[("msisdn", "^.*2222$", "find")] is Remedy.REVERSED_FIELD
-        assert by[("name", "^som", "find")] is Remedy.COLLATION_INDEX
+        assert by[("name", "^som", "find")] is Remedy.NORMALIZED_FIELD
         assert by[("name", "^Anan", "find")] is Remedy.REWRITE
         assert by[("email", "\\.net$", "update")] is Remedy.FIX_FILTER
         assert by[("name", "^S", "aggregate")] is Remedy.NONE  # $regexMatch in $project
@@ -206,8 +222,8 @@ class TestEndToEnd:
         )
         remedies = [f.remedy for f in findings]
         assert remedies == [
-            Remedy.COLLATION_INDEX,  # ^tocde i
-            Remedy.COLLATION_INDEX,  # ^Som i, 120k docs
+            Remedy.NORMALIZED_FIELD,  # ^tocde i
+            Remedy.NORMALIZED_FIELD,  # ^Som i, 120k docs
             Remedy.NONE,  # ^vip
             Remedy.NONE,  # ^gold
             Remedy.REWRITE,  # $not ^Test

@@ -106,17 +106,29 @@ out an API key.
 
 ### Step 3: read the summary
 
-The summary table has one row per *shape* (`namespace`, `field`, `command`, `category`), worst
-first. Two columns matter most:
+`--view summary` answers three questions in this order:
 
-* `category` says how badly the regex defeats indexes (see [Reading the output](#reading-the-output)).
-  `prefix` is fine; everything else scans.
-* `remedy` says what to do about it (see [Remedies](#remedies-what-to-do-about-each-shape)).
-  The full instruction, with the real field name, is in the `remedy_how` column of the CSV/JSON
-  and in the "What to do" section of the dashboard.
+1. **How bad is it?** One headline sentence, for example: *"21 slow operation(s) used $regex,
+   8.1 s in total across 2 collection(s). aisops.customers accounts for 99% of it. Biggest win:
+   MongoDB Search for note on aisops.customers (67% of regex time)."*
+2. **Where does it hurt?** "Where the regex time goes": time, share, operations and shapes to
+   fix per database, then per collection, costliest first.
+3. **What do I do?** "What to do, biggest win first": one numbered block per shape that needs
+   work. Each block gives:
+   * the cost (time, share, operations, last seen, apps);
+   * why it is slow (COLLSCAN count, keys/docs scanned per op against what was returned);
+   * the fix with its effort (`index only`, `index + query change`, `app change`,
+     `app change + backfill`, `new infrastructure`);
+   * a copy-paste `mongosh` snippet aimed at the real database, collection and field.
 
-Sanity checks on the numbers: `collscan` > 0 and `docs examined` far above what the query
-returned confirm the regex is really the cost, not just present.
+The table of every shape follows. A shape is (`namespace`, `field`, `command`, `category`), and
+shapes are ranked by **total time spent**. Each operation is counted once, even when its filter
+holds several regexes. `category` says how badly the regex defeats indexes (see
+[Reading the output](#reading-the-output)): `prefix` is fine, everything else scans. `remedy`
+says what to do about it (see [Remedies](#remedies-what-to-do-about-each-shape)).
+
+The snippets are starting points written from what the log showed. Review them and check
+`explain()` before running anything on production, especially the backfill `updateMany` calls.
 
 ### Step 4: produce something you can share
 
@@ -129,6 +141,21 @@ open reports/<ClusterName>.html
 The HTML is a single file with no external dependencies: attach it to a ticket or mail it. The
 CSV has one row per finding for spreadsheets. Add `-n db.coll` to focus on one collection.
 
+### Step 4b: look at a specific moment (an incident)
+
+```bash
+# 30 minutes either side of the moment the alert fired (default --around 30m)
+.venv/bin/mongoops regex-finder atlas -c <ClusterName> --at "2026-10-07 14:30" --view summary
+
+# an exact range, in Bangkok time, whatever zone this laptop is in
+.venv/bin/mongoops regex-finder atlas -c <ClusterName> \
+  --since "2026-10-07 13:00" --until "2026-10-07 16:00" --tz Asia/Bangkok
+```
+
+A date/time without an offset is read as **UTC**. In a terminal, the tool asks once whether you
+meant UTC or this machine's zone; in scripts it stays UTC and says so on stderr. See
+[Time windows and time zones](#time-windows-and-time-zones).
+
 ### Step 5 (optional): try it without touching a real cluster
 
 With the Atlas CLI and Docker installed, `make test-atlas-local` spins up a local MongoDB, seeds a
@@ -138,7 +165,9 @@ every category and remedy looks like before reading production output.
 ### If you see nothing
 
 `0 slow query line(s)` on every node means no operation crossed the slow threshold in the window.
-Widen it (`--since 7d`), or check the cluster tier: Performance Advisor needs M10 or larger.
+Widen it (`--since 7d`), or check the cluster tier: Performance Advisor needs M10 or larger. The
+last stderr line repeats the window that was actually used, so a time read in the wrong zone shows
+up there.
 `0 regex usage(s) found` with slow lines present is a genuine result: the slow queries are slow
 for other reasons.
 
@@ -173,14 +202,21 @@ mongoops regex-finder atlas --project-id 5f1a... --cluster Cluster0
 # Atlas: last 6 hours, one namespace, CSV for a ticket
 mongoops regex-finder atlas -p 5f1a... -c Cluster0 --since 6h -n shop.orders -f csv -o out/regex.csv
 
+# Atlas: the hour around an incident, read in the cluster team's zone
+mongoops regex-finder atlas -p 5f1a... -c Cluster0 --at "2026-10-07 14:30" --around 1h --tz Asia/Bangkok
+
+# Which collections hurt most, as CSV (one row per collection)
+mongoops regex-finder atlas -p 5f1a... -c Cluster0 --since 7d --view hotspots -f csv
+
 # Ops Manager (EA): one replica set, JSON summary only
 mongoops regex-finder ops-manager -p 5f1a... --replica-set rs0 -f json --view summary
 
 # Ops Manager with a self-signed certificate
 mongoops regex-finder ops-manager -p 5f1a... --ca-file /etc/ssl/om-ca.pem
 
-# Log file from an EA node (gz ok), only ops slower than 100 ms
-mongoops regex-finder logfile /var/log/mongodb/mongod.log.gz --min-ms 100
+# Log file from an EA node (gz ok), only ops slower than 100 ms, only yesterday 09:00-12:00 UTC
+mongoops regex-finder logfile /var/log/mongodb/mongod.log.gz --min-ms 100 \
+  --since 2026-10-07T09:00Z --until 2026-10-07T12:00Z
 
 # Live node
 mongoops regex-finder live --uri "mongodb://user:pw@db1:27017/?directConnection=true"
@@ -189,10 +225,71 @@ mongoops regex-finder live --uri "mongodb://user:pw@db1:27017/?directConnection=
 mongoops regex-finder atlas -p 5f1a... -c Cluster0 --html reports/cluster0.html
 ```
 
-Common options: `--format table|csv|json|html`, `--view summary|details|both`, `--output FILE`,
-`--html FILE`, `--namespace db.coll` (repeatable), `--min-ms N`, `--include-getmore`,
-`--max-rows N` (table only). API sources add `--since` (`24h`, `7d`, or ISO-8601), `--duration`,
-`--n-logs`.
+Common options:
+
+* output: `--format table|csv|json|html`, `--view summary|details|both|hotspots`,
+  `--output FILE`, `--html FILE`, `--max-rows N` (table only);
+* filters: `--namespace db.coll` (repeatable), `--min-ms N`, `--include-getmore`;
+* time, on every source: `--since`, `--until`, `--duration`, `--at`, `--around`, `--tz` (see
+  [Time windows and time zones](#time-windows-and-time-zones)).
+
+API sources add `--n-logs` (lines per node, max 20000). When a node returns exactly that many
+lines, part of the window is missing. The tool warns on stderr and in the dashboard header;
+narrow the window when that happens.
+
+Views:
+
+| `--view` | Table | CSV | JSON keys |
+| --- | --- | --- | --- |
+| `both` (default) | headline, where the time goes, action plan, shapes, findings | findings | `headline`, `hotspots`, `summary`, `findings` |
+| `summary` | headline, where the time goes, action plan, shapes | shapes | `headline`, `hotspots`, `summary` |
+| `hotspots` | headline, where the time goes | collections | `headline`, `hotspots` |
+| `details` | findings | findings | `findings` |
+
+Shape rows (CSV and JSON `summary`) keep their original columns first, then add `ops`,
+`total_ms`, `share_pct`, `total_keys_examined`, `total_scanned`, `total_returned`,
+`scanned_per_returned`, `apps`, `first_seen`, `last_seen`, `effort` and `fix_snippet`.
+
+### Time windows and time zones
+
+| Flags | Window |
+| --- | --- |
+| none | API sources: last 24h (Performance Advisor default). `logfile` / `live`: everything |
+| `--since 6h` | 6 hours ago until now |
+| `--since T1 --until T2` | `[T1, T2)` |
+| `--since T --duration 2h` | `T` to `T + 2h` |
+| `--until T --duration 2h` | `T - 2h` to `T` |
+| `--duration 6h` | last 6 hours |
+| `--at T [--around 30m]` | `T - around` to `T + around`; `--around` defaults to 30m |
+
+`T` is a relative duration (`90m`, `6h`, `7d`, counted back from now) or a date/time:
+`2026-10-07`, `2026-10-07 14:30`, `2026-10-07T14:30:00Z`, `2026-10-07T14:30+07:00`. `--at`
+cannot be mixed with `--since`/`--until`/`--duration`. Flag combinations that don't make sense
+exit with code 2 and say why.
+
+A date/time **with** an offset (`Z`, `+07:00`) means exactly that. One **without** an offset is
+read in this order:
+
+1. `--tz ZONE` or `MONGOOPS_TZ=ZONE`: an IANA name (`Asia/Bangkok`), `UTC`, `local`, or `+07:00`;
+2. in an interactive terminal, a one-time prompt showing both readings:
+
+   ```text
+   "2026-10-07 14:30" has no time zone:
+     u  UTC           2026-10-07 14:30 UTC  (= 2026-10-07 21:30 +07:00 here)
+     l  this machine  2026-10-07 14:30 +07:00  (= 2026-10-07 07:30 UTC)
+   Read it as [u/l] [u]:
+   ```
+
+3. otherwise UTC, with a note on stderr (scripts and CI never block on a prompt).
+
+`--tz` also sets the zone of times shown to people: the window, the "last seen" in the action plan
+and the findings' time column in the table and dashboard (the dashboard tooltip keeps the raw UTC
+value). CSV and JSON always carry the log's UTC timestamps so they stay comparable across runs.
+
+How each source applies the window: `atlas` and `ops-manager` send it to Performance Advisor as
+`since` + `duration`. `logfile` and `live` filter on each line's own timestamp; lines with an
+unreadable timestamp are dropped when a window is set. `live` only holds the last ~1024 lines, so
+the window can only narrow it.
 
 ### HTML dashboard
 
@@ -200,14 +297,19 @@ Common options: `--format table|csv|json|html`, `--view summary|details|both`, `
 no CDN, opens offline or from a ticket attachment) in addition to the normal stdout output;
 `--format html` sends the same page to stdout / `--output` instead. The page shows:
 
-* header chips: source, target (cluster / hosts / file / credential-stripped URI), time window,
-  filters, generation time;
-* at-a-glance cards: regex usages, distinct shapes, index-defeating shapes, COLLSCAN operations,
-  slowest op, namespaces affected, and how many shapes need Search / an index fix / a rewrite;
-* "What to do": one card per remedy listing the shapes it applies to with the concrete
-  instruction, plus the Search deployment note when Search is recommended;
-* a by-category bar chart, the shapes table (worst first, same columns as the terminal summary),
-  and the full findings table with a live text filter and click-to-sort headers;
+* header chips: source, target (cluster / hosts / file / credential-stripped URI), time window
+  (in the `--tz` zone with its UTC equivalent), filters, generation time, and a warning chip
+  when a node hit the `--n-logs` cap;
+* the headline sentence;
+* at-a-glance cards: regex time, slow operations with `$regex`, collections affected, shapes to
+  fix, index-defeating shapes, COLLSCAN operations, slowest op;
+* "Where the regex time goes": databases, then their collections, with a share-of-time bar,
+  operations, shapes, shapes to fix, COLLSCAN operations and the main fix;
+* "What to do, biggest win first": one numbered card per shape that needs work (cost, why,
+  fix + effort, instruction, `mongosh` snippet with a Copy button), the Search deployment note
+  when Search is recommended, and a folded list of shapes that need no action now;
+* the shapes table (costliest first, same columns as the terminal summary) and the full
+  findings table with a live text filter and click-to-sort headers;
 * the category and remedy legends.
 
 Every `make probe-*` and `make test-atlas-*` run writes one to `reports/<target>-<UTC stamp>.html`
@@ -221,11 +323,12 @@ make probe-atlas && open reports/probe-atlas-latest.html
 
 Each finding is one regex inside one slow operation, with the field it targets, the pattern and
 options, the plan summary, timings and scan counters from the log line. The summary groups
-findings by `(namespace, field, command, category)` and sorts the worst categories first:
+findings by `(namespace, field, command, category)` and sorts them by total time spent (each
+operation counted once). Ties go to shapes that need action, then to the worst category:
 
 | Category | Meaning | Index impact |
 | --- | --- | --- |
-| `case_insensitive` | `$options: "i"` or `(?i)` | Cannot use a regular index efficiently. Consider a case-insensitive collation index or a normalised (lower-cased) field. |
+| `case_insensitive` | `$options: "i"` or `(?i)` | Cannot use any index efficiently, not even a case-insensitive collation index (`$regex` is not collation-aware). Use a lower-cased copy of the field, or an equality with a collation for exact matches. |
 | `leading_wildcard` | starts with `.*` or `^.*` | Anchor is useless, scans everything. |
 | `negated` | under `$not` / `$nin` | No index bounds can be derived. |
 | `unanchored` | no leading `^` | Every index key (or document) is tested. |
@@ -235,21 +338,29 @@ findings by `(namespace, field, command, category)` and sorts the worst categori
 ### Remedies: what to do about each shape
 
 Every finding also carries a `remedy` and a one-sentence `remedy_how` with the real field name
-filled in (the dashboard groups them under "What to do"). The rules are deliberately
+filled in. Every shape row also carries the remedy's `effort` and a `fix_snippet` for `mongosh`
+(empty for `none` and `monitor`). The rules are deliberately
 conservative: the cheapest fix that works wins, MongoDB Search is only suggested when the
 operation is on the read path *and* the log shows a real scan, and write-path regexes are never
 sent to Search because `$search` is an aggregation-only stage.
 
-| Remedy | When | What it tells you to do |
-| --- | --- | --- |
-| `none` | case-sensitive prefix using an index; or `$regexMatch`/`$regexFind` used as a projection, not a filter | nothing |
-| `btree_index` | prefix regex but the plan is `COLLSCAN` | create a normal index on the field |
-| `collation_index` | case-insensitive regex whose body is a literal prefix (`^som` with `i`) | `{ collation: { locale, strength: 2 } }` index and query with the same collation using a case-sensitive prefix |
-| `reversed_field` | suffix match on an identifier-like literal (`^.*99999$` on an MSISDN, digit-heavy, no spaces) | store a reversed copy, index it, query `{ field_rev: /^99999/ }` |
-| `rewrite` | negated regex (`$not`/`$nin`); or a prefix regex inside `$expr` | invert the predicate / add a flag field; move the regex to a plain predicate |
-| `fix_filter` | any remaining regex in an `update`, `delete`, `remove`, `findAndModify` filter | `$search` cannot run there: narrow the filter on an indexed field, or `$search` for `_id`s then mutate by `_id` |
-| `search` | unanchored / leading-wildcard / case-insensitive regex on free text, on `find`/`aggregate`, with a heavy scan (>= 1000 keys or docs examined, or `COLLSCAN` returning < 1% of what it scanned) | create a MongoDB Search index on the field and query with `$search` first; the sentence names the operator (`text`/`phrase` with the standard analyzer, `wildcard`/`regex` over a keyword analyzer, or `autocomplete` for type-ahead) |
-| `monitor` | same shapes without the scan evidence (small collection) | no action yet; recheck as the collection grows |
+| Remedy | Effort | When | What it tells you to do |
+| --- | --- | --- | --- |
+| `none` | nothing to do | case-sensitive prefix using an index; or `$regexMatch`/`$regexFind` used as a projection, not a filter | nothing |
+| `btree_index` | index only | prefix regex but the plan is `COLLSCAN` | create a normal index on the field |
+| `collation_index` | index + query change | case-insensitive **exact** match (`^somchai$` with `i`) | replace the regex with an equality `{ field: "somchai" }` run with `collation({ locale: "en", strength: 2 })`, and create an index with the same collation |
+| `normalized_field` | app change + backfill | case-insensitive **prefix** (`^som` with `i`) | store a lower-cased copy (`field_lower`), index it, query `{ field_lower: /^som/ }` |
+| `reversed_field` | app change + backfill | suffix match on an identifier-like literal (`^.*99999$` on an MSISDN, digit-heavy, no spaces) | store a reversed copy, index it, query `{ field_rev: /^99999/ }` |
+| `rewrite` | app change | negated regex (`$not`/`$nin`); or a prefix regex inside `$expr` | precompute an indexed flag field; move the regex to a plain predicate |
+| `fix_filter` | app change | any remaining regex in an `update`, `delete`, `remove`, `findAndModify` filter | `$search` cannot run there: narrow the filter on an indexed field, or `$search` for `_id`s then mutate by `_id` |
+| `search` | new infrastructure | unanchored / leading-wildcard / case-insensitive regex on free text, on `find`/`aggregate`, with a heavy scan (>= 1000 keys or docs examined, or `COLLSCAN` returning < 1% of what it scanned) | create a MongoDB Search index on the field and query with `$search` first. The operator follows the shape: `phrase` for a case-sensitive literal with spaces, `text` for other literals (standard analyzer), `wildcard` for a leading-wildcard literal and `regex` for a non-literal pattern (keyword analyzer) |
+| `monitor` | nothing to do yet | same shapes without the scan evidence (small collection) | no action yet; recheck as the collection grows |
+
+Why `$regex` with `i` never gets a collation index: MongoDB documents that
+["case-insensitive indexes do not improve performance for `$regex` queries, as the `$regex`
+operator is not collation-aware"](https://www.mongodb.com/docs/manual/reference/operator/query/regex/).
+A collation index only helps once the regex has become an equality, which is why
+`collation_index` is limited to exact matches and prefixes go to `normalized_field`.
 
 Search availability differs by deployment and the dashboard says so next to the Search card:
 Atlas M10+ (optionally dedicated Search Nodes), or self-managed as the paid Enterprise Advanced
@@ -525,8 +636,9 @@ make the tool easy to automate:
 
 * **Read-only and idempotent.** It never writes to the cluster, so it can run on any schedule and
   in any environment, including production.
-* **Machine-readable output.** `-f json` gives `{"summary": [...], "findings": [...]}`; every row
-  has `category`, `remedy`, `collscan_count` / `plan_summary`, so a gate is a `jq` expression.
+* **Machine-readable output.** `-f json` gives `{"headline": "...", "hotspots": [...],
+  "summary": [...], "findings": [...]}`. Every row has `category`, `remedy`, `collscan_count` /
+  `plan_summary`, so a gate is a `jq` expression. Timestamps stay UTC whatever `--tz` says.
 * **Exit codes.** `0` when the run succeeded (findings or not), `2` on a usage or API error. The
   tool does not fail on findings by itself; the gate decides, see below.
 * **Credentials via environment.** The same variable names as the Atlas CLI and mongocli, so
@@ -601,8 +713,8 @@ something exercised the database, not on a pull request's unit tests. Two placem
    credentials in CI.
 
 Gate policy that has worked in practice: **block** on `search`, `fix_filter` and `btree_index`
-(a real scan with a known fix), **warn** on `collation_index`, `reversed_field` and `rewrite`,
-ignore `none` and `monitor`. `--fail-on` takes the blocking list and exits 1 when any shape
+(a real scan with a known fix), **warn** on `collation_index`, `normalized_field`,
+`reversed_field` and `rewrite`, ignore `none` and `monitor`. `--fail-on` takes the blocking list and exits 1 when any shape
 carries one of those remedies, after the report has been written:
 
 ```bash
@@ -615,7 +727,10 @@ The blocking shapes are printed on stderr (`blocking: shop.products name find ->
 separate warning count, or a different split, `jq` over the JSON still works:
 
 ```bash
-jq '[.summary[] | select(.remedy | IN("collation_index","reversed_field","rewrite"))] | length' reports/regex.json
+jq '[.summary[] | select(.remedy | IN("collation_index","normalized_field","reversed_field","rewrite"))] | length' reports/regex.json
+
+# the collection carrying most of the regex time, and its share
+jq -r '.hotspots[0].collections[0] | "\(.namespace) \(.share_pct)%"' reports/regex.json
 ```
 
 Ratchet instead of a hard rule when starting on a cluster that already has findings: commit the
@@ -691,8 +806,10 @@ make probe-local                                    # atlas-local via getLog
 ```
 
 Knobs: `ATLAS_CLUSTER` (default `cluster-free`), `SINCE` (default `24h`, relative or ISO-8601),
-`NAMESPACE` (optional `db.coll` filter), `VIEW` (`summary`, `details`, `both`), `ARGS` (anything
-else `mongoops regex-finder` accepts), `REPORT_DIR` (default `reports`). Nothing is written to the
+`NAMESPACE` (optional `db.coll` filter), `VIEW` (`summary`, `details`, `both`, `hotspots`), `ARGS`
+(anything else `mongoops regex-finder` accepts, e.g.
+`SINCE=2026-10-07T09:00Z ARGS='--until 2026-10-07T12:00Z --tz Asia/Bangkok'`), `REPORT_DIR`
+(default `reports`). Nothing is written to the
 cluster; each run leaves an HTML dashboard in `reports/` (see above).
 
 `probe-local` reads the server's in-memory log ring buffer (1024 lines). On atlas-local the
@@ -750,7 +867,7 @@ src/mongoops/
     perf_advisor.py          slowQueryLogs fetch + pagination shared by Atlas and Ops Manager
     atlas_api.py             Atlas Admin API v2 client (digest or service account)
     ops_manager_api.py       Ops Manager / Cloud Manager API client (digest)
-    timeutil.py              --since / --duration parsing
+    timeutil.py              time windows (--since/--until/--duration/--at/--around), zones, display
     html_theme.py            CSS + table filter/sort script shared by every HTML report
   waf_check/
     model.py                 Pillar / Kind / Severity / Status, CheckSpec, Outcome -> CheckResult
@@ -767,11 +884,13 @@ src/mongoops/
                              attest-init, checks
   regex_finder/
     detector.py              pure regex detection + index-friendliness classification
-    analyze.py               SlowQuery x RegexUsage -> Finding, filters
-    remedy.py                pure rule table: finding -> remedy + instruction
-    summary.py               per-shape aggregation, severity order, advice text
+    analyze.py               SlowQuery x RegexUsage -> Finding (with operation id), filters, window
+    remedy.py                pure rule table: finding -> remedy + instruction, effort, Search operator
+    fixes.py                 pure mongosh snippet per remedy (Python data -> mongosh literals)
+    summary.py               per-shape aggregation, per-operation time totals, ranking, advice text
+    hotspots.py              database -> collection roll-up and the headline sentence
     report.py                table / csv / json rendering, dispatch to html
-    html_report.py           self-contained HTML dashboard
+    html_report.py           self-contained HTML dashboard (rollup, action plan, copy buttons)
     sources.py               I/O adapters: atlas, ops-manager, logfile, live
     cli.py                   typer sub-commands
 tests/                       unit tests (default) and tests/integration (opt-in, -m integration)

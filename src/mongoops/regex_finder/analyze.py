@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from mongoops.common.mongolog import SlowQuery, parse_log_line
+from mongoops.common.timeutil import NO_WINDOW, TimeWindow, timestamp_ms
 from mongoops.regex_finder.detector import (
     RegexCategory,
     RegexUsage,
@@ -50,6 +52,8 @@ class Finding:
     log_format: str
     remedy: Remedy
     remedy_how: str
+    op_id: str = ""
+    """Same for every regex of one logged operation, so per-operation totals count it once."""
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "category": str(self.category), "remedy": str(self.remedy)}
@@ -60,6 +64,8 @@ class AnalyzeOptions:
     include_getmore: bool = False
     namespaces: frozenset[str] = frozenset()
     min_duration_ms: int = 0
+    window: TimeWindow = NO_WINDOW
+    """Client-side time filter on the log timestamp (for sources the API does not filter)."""
 
 
 def analyze_lines(lines: Iterable[SourceLine], opts: AnalyzeOptions) -> Iterator[Finding]:
@@ -73,7 +79,13 @@ def analyze_lines(lines: Iterable[SourceLine], opts: AnalyzeOptions) -> Iterator
 
 def findings_for(slow: SlowQuery, origin: str) -> tuple[Finding, ...]:
     """All regex findings for one slow query (pure)."""
-    return tuple(_finding(slow, origin, usage) for usage in regex_usages(slow))
+    op_id = operation_id(origin, slow.raw)
+    return tuple(_finding(slow, origin, usage, op_id) for usage in regex_usages(slow))
+
+
+def operation_id(origin: str, raw: str) -> str:
+    """Stable short id of one log line on one node."""
+    return hashlib.sha1(f"{origin}\n{raw}".encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def regex_usages(slow: SlowQuery) -> tuple[RegexUsage, ...]:
@@ -90,10 +102,17 @@ def _passes(slow: SlowQuery, src: SourceLine, opts: AnalyzeOptions) -> bool:
     ns = slow.namespace or src.namespace_hint
     if opts.namespaces and ns not in opts.namespaces:
         return False
+    if opts.window.bounded and not _in_window(slow.timestamp, opts.window):
+        return False
     return (slow.duration_ms or 0) >= opts.min_duration_ms
 
 
-def _finding(slow: SlowQuery, origin: str, usage: RegexUsage) -> Finding:
+def _in_window(timestamp: str | None, window: TimeWindow) -> bool:
+    ms = timestamp_ms(timestamp)
+    return ms is not None and window.contains(ms)
+
+
+def _finding(slow: SlowQuery, origin: str, usage: RegexUsage, op_id: str) -> Finding:
     rec = with_field(
         recommend(
             category=usage.category,
@@ -131,4 +150,5 @@ def _finding(slow: SlowQuery, origin: str, usage: RegexUsage) -> Finding:
         log_format=slow.log_format,
         remedy=rec.remedy,
         remedy_how=rec.how,
+        op_id=op_id,
     )

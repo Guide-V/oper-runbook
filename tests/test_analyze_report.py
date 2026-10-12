@@ -6,6 +6,7 @@ import json
 
 from mongoops.regex_finder.analyze import AnalyzeOptions, SourceLine, analyze_lines
 from mongoops.regex_finder.detector import RegexCategory
+from mongoops.regex_finder.remedy import Remedy
 from mongoops.regex_finder.report import render, summarize
 
 
@@ -89,13 +90,14 @@ class TestAnalyzeLegacy:
 
 
 class TestReport:
-    def test_summary_groups_and_orders_worst_first(
+    def test_summary_groups_and_orders_costliest_first(
         self, atlas_local_lines: tuple[str, ...]
     ) -> None:
         findings = tuple(analyze_lines(_lines(atlas_local_lines), AnalyzeOptions()))
         rows = summarize(findings)
         assert sum(r.count for r in rows) == len(findings)
-        assert rows[0].category == RegexCategory.CASE_INSENSITIVE
+        assert [r.total_ms for r in rows] == sorted((r.total_ms for r in rows), reverse=True)
+        assert (rows[0].command, rows[0].remedy) == ("update", Remedy.FIX_FILTER)  # 11 of 16 ms
         assert rows[-1].category == RegexCategory.PREFIX
         update_row = next(r for r in rows if r.command == "update")
         assert (update_row.count, update_row.collscan_count, update_row.max_duration_ms) == (
@@ -130,14 +132,33 @@ class TestReport:
         findings = tuple(analyze_lines(_lines(atlas_local_lines), AnalyzeOptions()))
         rows = list(csv.DictReader(io.StringIO(render(findings, fmt="csv", view="summary"))))
         assert len(rows) == len(summarize(findings))
-        assert rows[0]["advice"].startswith("Case-insensitive")
+        assert rows[0]["remedy"] == "fix_filter"
+        assert list(rows[0])[:3] == [
+            "namespace",
+            "field",
+            "command",
+        ]  # old columns keep their place
+        assert {"ops", "total_ms", "share_pct", "effort", "fix_snippet"} <= set(rows[0])
+        assert "updateMany(" in rows[0]["fix_snippet"]
 
     def test_json_both(self, atlas_local_lines: tuple[str, ...]) -> None:
         findings = tuple(analyze_lines(_lines(atlas_local_lines), AnalyzeOptions()))
         payload = json.loads(render(findings, fmt="json", view="both"))
-        assert set(payload) == {"summary", "findings"}
+        assert set(payload) == {"headline", "hotspots", "summary", "findings"}
         assert len(payload["findings"]) == len(findings)
         assert payload["findings"][0]["category"] == "case_insensitive"
+        assert payload["hotspots"][0]["collections"][0]["namespace"] == "mongoops_test.customers"
+
+    def test_hotspots_view_in_every_format(self, atlas_local_lines: tuple[str, ...]) -> None:
+        findings = tuple(analyze_lines(_lines(atlas_local_lines), AnalyzeOptions()))
+        payload = json.loads(render(findings, fmt="json", view="hotspots"))
+        assert set(payload) == {"headline", "hotspots"}
+        rows = list(csv.DictReader(io.StringIO(render(findings, fmt="csv", view="hotspots"))))
+        assert [(r["database"], r["collection"], r["ops"]) for r in rows] == [
+            ("mongoops_test", "customers", "14")
+        ]
+        text = render(findings, fmt="table", view="hotspots")
+        assert "Where the regex time goes" in text and "What to do" not in text
 
     def test_table_limits_detail_rows_and_handles_empty(
         self, atlas_local_lines: tuple[str, ...]
@@ -146,4 +167,23 @@ class TestReport:
         text = render(findings, fmt="table", view="both", max_detail_rows=5)
         assert "showing first 5" in text
         assert "$regex usage summary" in text
+        assert "Where the regex time goes" in text
+        assert "What to do, biggest win first" in text
+        assert " 1. mongoops_test.customers  email  (update, unanchored)" in text
         assert "No $regex usage found" in render((), fmt="table", view="both")
+
+    def test_table_keeps_brackets_in_patterns(self) -> None:
+        line = json.dumps(
+            {
+                "t": {"$date": "2026-09-04T03:00:00.000+00:00"},
+                "msg": "Slow query",
+                "attr": {
+                    "type": "command",
+                    "ns": "db.c",
+                    "command": {"find": "c", "filter": {"sku": {"$regex": "^[a-z]+-[0-9]"}}},
+                    "durationMillis": 5,
+                },
+            }
+        )
+        findings = tuple(analyze_lines([SourceLine(line=line, origin="o")], AnalyzeOptions()))
+        assert "[a-z]+-[0-9]" in render(findings, fmt="table", view="both")

@@ -185,7 +185,8 @@ say which regexes are index-hostile.
     * order of rules: expression operators (`$regexMatch`/`$regexFind` outside `$expr` have no
       index implication -> `none`; prefix inside `$expr` -> `rewrite` to a plain predicate),
       negated -> `rewrite`, prefix -> `none` or `btree_index` on COLLSCAN, case-insensitive
-      literal prefix -> `collation_index`, identifier suffix -> `reversed_field`, write path ->
+      literal prefix -> `collation_index` (wrong, corrected in decision 51), identifier suffix
+      -> `reversed_field`, write path ->
       `fix_filter`, heavy scan -> `search`, otherwise `monitor`;
     * "heavy" = >= 1000 keys/docs examined, or COLLSCAN with scanned/returned >= 100. This is
       what stops a 3-document atlas-local collection from being told to buy Search Nodes; the
@@ -542,3 +543,161 @@ the HTML report and the comparison are the scope.
   reports and is not built.
 * A baseline from a different catalog compares only the checks both know; a check removed from
   the catalog is reported as no longer evaluated.
+
+## 2026-10-08: `regex-finder` UX: where it hurts, what to do, and incident windows
+
+### Goal
+
+People running regex-finder found the output hard to act on. They could not tell which
+database or collection had the most problems, or what to do next. They also wanted to look at
+the cluster at a specific date and time (an incident) rather than "the last N hours". Design
+choices agreed before building:
+
+* both an explicit range (`--since`/`--until`) and an incident mode (`--at`/`--around`);
+* times stay UTC, with a prompt offering this machine's zone;
+* a roll-up by database, then collection.
+
+### Decisions
+
+48. **Rank shapes by time spent, counting each operation once.** The old order was worst
+    category first. On the probe data that put a 0.9 s case-insensitive shape at the top and the
+    5.4 s COLLSCAN fifth. Time is what the cluster pays, so the summary now sorts by total
+    duration. Ties go to shapes that need action, then to the worst category, count and max ms.
+    * A `$or` of two regexes is two findings but one operation. Each finding therefore carries
+      `op_id`: 12 hex characters of SHA-1 over origin + raw log line, the same line on the same
+      node. Every total (ops, time, COLLSCAN ops, scanned, returned) is per distinct operation.
+      Without this, the `$or` shape counted its time twice.
+    * `share_pct` is the shape's share of all regex time. It falls back to the share of
+      operations when nothing was timed (e.g. legacy lines without a duration).
+    * New `SummaryRow` fields are appended with defaults, so the CSV keeps its original columns
+      first and code that builds rows (`waf_check`, test fixtures) is unchanged.
+
+49. **"Where it hurts": databases, then collections, plus a one-sentence headline.**
+    `hotspots.py` is pure. It rolls findings up by database, then collection, with time,
+    share, operations, shapes, shapes to fix, COLLSCAN operations and the main fix. The headline
+    names the total, the costliest collection and the biggest single win, for example: "21 slow
+    operation(s) used $regex, 8.1 s in total across 2 collection(s). aisops.customers accounts
+    for 99% of it. Biggest win: MongoDB Search for note on aisops.customers (67% of regex
+    time)." Table, dashboard and JSON (`headline`, `hotspots`) all show it first. The new
+    `--view hotspots` gives just this; as CSV it is one row per collection, which is the
+    spreadsheet the team asked for.
+
+50. **An action plan instead of a grouped list.** One numbered block per shape that needs work,
+    costliest first. Each block has:
+    * the cost: time, share, ops, last seen in the display zone, and the apps;
+    * why it is slow: COLLSCAN count, keys/docs scanned per op against what was returned;
+    * the fix with an **effort** tag: `index only`, `index + query change`, `app change`,
+      `app change + backfill` or `new infrastructure`, so a DBA-only fix can be told apart from
+      an app release or a budget line;
+    * a copy-paste `mongosh` snippet (`fixes.py`) aimed at the real database, collection and
+      field: `createIndex`, the collation equality, a backfill `updateMany` with a pipeline plus
+      the index and the rewritten query, `createSearchIndex` with a static mapping (nested
+      `document` mappings for dotted fields) plus the `$search` stage, or a before/after for
+      write filters.
+
+    Snippets are built as Python data and printed by one serializer, `_lit`: bare keys when they
+    are valid identifiers, and `Raw` for regex literals and `<placeholders>`. They are never
+    assembled from strings, so quoting, escaping and the JSON-vs-mongosh style cannot drift.
+    Shapes needing no action (`none`, `monitor`) are folded into "N shape(s) need no action
+    now". Snippets carry their caveats as comments (M10+/mongot, eventual consistency, "Search
+    matches words, not substrings", batch the backfill off-peak); they are starting points,
+    not migrations.
+    * The `$search` operator is chosen in one place, `remedy.search_operator`. Both the
+      remedy sentence and the snippet use it: `phrase` for a case-sensitive literal with
+      spaces, `text` for other literals, `wildcard` / `regex` over a keyword analyzer for
+      leading wildcards and non-literals. The first render said "text operator" next to a
+      `phrase` snippet, which is why the choice was centralised; a test now holds them equal.
+
+51. **Correction: a case-insensitive `$regex` cannot use a collation index.** Decision 18
+    sent `^som` with `i` to a collation index. The MongoDB `$regex` reference says
+    "Case-insensitive indexes do not improve performance for $regex queries, as the $regex
+    operator is not collation-aware." Now:
+    * `collation_index` applies only to an exact match `^literal$` with `i`. The fix is to
+      replace the regex with an equality run with `collation({ locale: "en", strength: 2 })`
+      and an index with the same collation.
+    * A case-insensitive prefix gets the new `normalized_field` remedy: a lower-cased copy, an
+      index on it, and the query `{ field_lower: /^som/ }`.
+    * `$expr` prefixes with `i` rewrite to the `_lower` field too.
+    * The `case_insensitive` advice text, README tables and the waf-check policy comment were
+      updated. `normalized_field` is not in the default `regex_block_on`, so the waf-check gate
+      behaves as before for these shapes (they were `collation_index`, also not blocked).
+
+52. **Time-window flags on every source, resolved once.** `common/timeutil.py` turns
+    `WindowSpec` (the flags as typed) into a `TimeWindow` (`[start, end)` epoch ms, either
+    side optional). The combinations:
+    * `--since` [`--until` | `--duration`];
+    * `--until` + `--duration`;
+    * `--duration` alone (counted back from now);
+    * `--at` [`--around`, default 30m].
+
+    `validate_window` rejects contradictions with a message that names the flags (`--at` with
+    a range, `--around` without `--at`, all three of since/until/duration, `--until` alone, an
+    end before the start); the CLI turns these into exit 2. The API sources pass the window to
+    Performance Advisor as `since` + `duration`. `logfile` and `live` filter client-side on
+    each line's own timestamp, and drop a line whose timestamp cannot be read when a window is
+    set: an unknown time is not evidence the line is inside. `parse_since_ms` stays for
+    `waf-check --slow-queries-since`.
+
+53. **Zones: UTC unless told otherwise, and ask only when a human is there.** A time with an
+    offset means exactly that. One without an offset is read in this order:
+    1. `--tz` / `MONGOOPS_TZ`: IANA name, `UTC`, `local` or `±HH:MM`;
+    2. a one-time prompt showing both readings side by side, only when stdin and stderr are
+       terminals and this machine is not on UTC;
+    3. otherwise UTC, with a dim stderr note naming the input and the flag to change it.
+
+    The prompt never blocks CI or a pipe, and the note keeps a wrong guess visible. `--tz` also
+    sets the zone of times shown to people: the window chip ("13:15 to 15:15 +07:00 (06:15 to
+    08:15 UTC)"), last seen, and the findings' time column, with the raw UTC value as the
+    dashboard tooltip. The DST-safe offset is printed on every row rather than once in the
+    header. CSV and JSON stay UTC so runs stay comparable and joinable. The resolved window is
+    also echoed on the last stderr line.
+    * Typer 0.27 vendors Click privately, so `click.Choice` is not importable. The prompt uses
+      `typer.prompt(value_proc=...)` raising `typer.BadParameter`.
+
+54. **Warn when Performance Advisor's `nLogs` cap was hit.** A node returning exactly
+    `--n-logs` lines means part of the window is missing and the ranking may be skewed. The
+    progress callback records a warning, printed on stderr and shown as a warning chip in the
+    dashboard header, telling the reader to narrow the window.
+
+55. **Fixes found along the way.**
+    * Rich parsed log text in table cells as markup, so a pattern like `[a-z]+` lost its
+      brackets. Every cell is now `rich.text.Text`; there is a regression test.
+    * `live --fail-on` exited 2 instead of 1 because the generic `except Exception` caught
+      `typer.Exit`. It is re-raised first.
+    * Dashboard, checked in headless Chrome on a synthetic 300k-document workload
+      (`tests/regex_workload.py`, built because the atlas-local fixture's 0-8 ms ops cannot
+      exercise ranking):
+      * long snippet lines widened the action cards past the page and hid the Copy button.
+        Fixed with a `minmax(0,1fr)` grid column and wrapped snippet lines; copying uses
+        `textContent`, so the pasted code keeps its own line breaks;
+      * `word-break: break-all` squeezed patterns to a few characters per line ("recor / d
+        1234 / 5$"); they now wrap at spaces with a minimum width;
+      * the 15-column findings table scrolls horizontally inside its box instead of widening
+        the page. `html_theme.py` is untouched because waf-check shares it.
+
+56. **Tests.**
+    * `test_hotspots.py`: per-operation totals, ranking, roll-up, headline, renderers.
+    * `test_timeutil.py`: every window combination and each rejected one, zones, display.
+    * `test_fixes.py`: a snippet per remedy, escaping, dotted fields, and sentence/snippet
+      operator agreement.
+    * `test_cli.py`:
+      * `--since`/`--until` and `--at`/`--around` on the fixture give the same 4 findings;
+      * naive input with `--tz` matches UTC input;
+      * the non-interactive note, and the prompt answered `l`;
+      * the window echo, and usage errors;
+      * `_api_window` parameters, the cap warning, `--view hotspots -f csv`.
+
+    294 unit tests pass; ruff and `mypy --strict` are clean.
+
+### Known limitations / follow-ups
+
+* Snippets are written from one sample pattern per shape. A shape with several patterns (the
+  `$or` above) gets the dominant one; the reader still has to cover the others.
+* `$toLower` in the `normalized_field` backfill is exact for ASCII only. Text needing locale
+  rules (Turkish dotless i, German ß) should use a collation-aware normalisation in the app.
+* Search snippets assume a static mapping on one field; an existing Search index on the
+  collection should be extended rather than a second one created.
+* Client-side window filtering on `logfile` reads the whole file. Fine for one day's log; a
+  seek by timestamp would be needed for very large archives.
+* The interactive prompt asks once per run; with several naive inputs (`--since` and
+  `--until`) the answer applies to all of them.

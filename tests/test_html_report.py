@@ -9,6 +9,7 @@ from mongoops.cli import app
 from mongoops.regex_finder.analyze import AnalyzeOptions, Finding, SourceLine, analyze_lines
 from mongoops.regex_finder.detector import RegexCategory
 from mongoops.regex_finder.report import ReportMeta, render, summarize
+from mongoops.regex_finder.summary import distinct_ops
 from tests.conftest import FIXTURES
 
 FIXTURE = str(FIXTURES / "atlas_local_slow_queries.jsonl")
@@ -49,8 +50,10 @@ class TestRenderHtml:
         html = render(findings, fmt="html", view="both", meta=META)
         assert f"Shapes ({len(summary)})" in html
         assert f"Findings ({len(findings)})" in html
-        collscans = sum(1 for f in findings if "COLLSCAN" in (f.plan_summary or ""))
+        ops = distinct_ops(findings)
+        collscans = sum(1 for f in ops if "COLLSCAN" in (f.plan_summary or ""))
         assert f'<div class="v">{collscans}</div><div class="l">COLLSCAN operations</div>' in html
+        assert f'<div class="v">{len(ops)}</div><div class="l">slow operations with' in html
         bad = sum(
             1 for r in summary if r.category not in (RegexCategory.PREFIX, RegexCategory.ANCHORED)
         )

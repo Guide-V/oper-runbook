@@ -4,18 +4,32 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, tzinfo
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
 
 from mongoops.common import atlas_api, ops_manager_api
 from mongoops.common.perf_advisor import ApiError, SlowQueryWindow
-from mongoops.common.timeutil import parse_duration_ms, parse_since_ms
+from mongoops.common.timeutil import (
+    NO_WINDOW,
+    TimeWindow,
+    WindowSpec,
+    describe_window,
+    format_instant,
+    is_naive,
+    is_utc,
+    local_zone,
+    parse_instant_ms,
+    parse_zone,
+    resolve_window,
+    validate_window,
+)
 from mongoops.regex_finder import sources
 from mongoops.regex_finder.analyze import AnalyzeOptions, Finding, SourceLine, analyze_lines
 from mongoops.regex_finder.remedy import Remedy
@@ -29,6 +43,8 @@ app = typer.Typer(
 )
 err = Console(stderr=True)
 
+API_DEFAULT_WINDOW = "last 24h (API default)"
+
 
 class Fmt(StrEnum):
     table = "table"
@@ -41,13 +57,19 @@ class ViewOpt(StrEnum):
     summary = "summary"
     details = "details"
     both = "both"
+    hotspots = "hotspots"
 
 
 # --- shared options ---------------------------------------------------------------------------
 
 FormatOpt = Annotated[Fmt, typer.Option("--format", "-f", help="Output format.")]
 ViewOption = Annotated[
-    ViewOpt, typer.Option("--view", help="summary (grouped), details (one row per hit) or both.")
+    ViewOpt,
+    typer.Option(
+        "--view",
+        help="summary (where the time goes + what to do + shapes), details (one row per hit), "
+        "both, or hotspots (database / collection roll-up only).",
+    ),
 ]
 OutputOpt = Annotated[
     Path | None, typer.Option("--output", "-o", help="Write output to this file instead of stdout.")
@@ -73,11 +95,45 @@ MaxRowsOpt = Annotated[
 SinceOpt = Annotated[
     str | None,
     typer.Option(
-        "--since", help='Window start: relative ("24h", "7d") or ISO-8601. API default: 24h.'
+        "--since",
+        help='Window start: an age ("24h", "7d") or a date/time ("2026-10-07 14:00", '
+        '"2026-10-07T14:00+07:00"). API sources default to the last 24h.',
+    ),
+]
+UntilOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--until",
+        help="Window end, same formats as --since. Needs --since, or --duration for a window "
+        "ending then.",
     ),
 ]
 DurationOpt = Annotated[
-    str | None, typer.Option("--duration", help='Window length from --since, e.g. "6h".')
+    str | None,
+    typer.Option(
+        "--duration",
+        help='Window length, e.g. "6h": from --since, up to --until, or the last 6h when alone.',
+    ),
+]
+AtOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--at",
+        help='Incident moment; the window is --around either side, e.g. --at "2026-10-07 14:30".',
+    ),
+]
+AroundOpt = Annotated[
+    str | None, typer.Option("--around", help="Margin either side of --at (default 30m).")
+]
+TzOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--tz",
+        envvar="MONGOOPS_TZ",
+        help="Zone for date/times typed without an offset and for times shown in the table and "
+        "dashboard: UTC, local, Asia/Bangkok, +07:00. Default UTC; asks when run interactively. "
+        "CSV/JSON stay UTC.",
+    ),
 ]
 NLogsOpt = Annotated[
     int, typer.Option("--n-logs", help="Max log lines per process (API max 20000).")
@@ -119,22 +175,19 @@ def _meta(
     source: str,
     target: str,
     *,
-    since: str | None = None,
-    duration: str | None = None,
+    window: str = "",
     namespaces: list[str] | None = None,
     min_ms: int = 0,
     include_getmore: bool = False,
+    tz: tzinfo = UTC,
 ) -> ReportMeta:
     """Describe the run for the dashboard header (pure)."""
-    window = " ".join(
-        p for p in (f"since {since}" if since else "", f"for {duration}" if duration else "") if p
-    )
     filters = (
         *(f"namespace {ns}" for ns in namespaces or ()),
         *((f"min {min_ms} ms",) if min_ms else ()),
         *(("getMore included",) if include_getmore else ()),
     )
-    return ReportMeta(source=source, target=target, window=window, filters=filters)
+    return ReportMeta(source=source, target=target, window=window, filters=filters, display_tz=tz)
 
 
 def _redact_uri(uri: str) -> str:
@@ -143,34 +196,104 @@ def _redact_uri(uri: str) -> str:
 
 
 def _analyze_options(
-    namespaces: list[str] | None, include_getmore: bool, min_ms: int
+    namespaces: list[str] | None,
+    include_getmore: bool,
+    min_ms: int,
+    window: TimeWindow = NO_WINDOW,
 ) -> AnalyzeOptions:
     return AnalyzeOptions(
         include_getmore=include_getmore,
         namespaces=frozenset(namespaces or ()),
         min_duration_ms=min_ms,
+        window=window,
     )
 
 
-def _window(
-    since: str | None, duration: str | None, namespaces: list[str] | None, n_logs: int
-) -> SlowQueryWindow:
+def _api_window(window: TimeWindow, namespaces: list[str] | None, n_logs: int) -> SlowQueryWindow:
     return SlowQueryWindow(
-        since_ms=parse_since_ms(since) if since else None,
-        duration_ms=parse_duration_ms(duration) if duration else None,
+        since_ms=window.start_ms,
+        duration_ms=window.duration_ms,
         namespaces=tuple(namespaces or ()),
         n_logs=n_logs,
     )
 
 
-def _emit(lines: Iterable[SourceLine], analyze: AnalyzeOptions, out: OutputOptions) -> None:
+# --- time window and zone ---------------------------------------------------------------------
+
+
+def _resolve_time(spec: WindowSpec, tz_name: str | None) -> tuple[TimeWindow, tzinfo]:
+    """Validate the flags, settle the zone (asking if needed), then resolve the window."""
+    validate_window(spec)
+    zone = _zone(spec, tz_name)
+    return resolve_window(spec, tz=zone), zone
+
+
+def _zone(spec: WindowSpec, tz_name: str | None) -> tzinfo:
+    if tz_name:
+        return parse_zone(tz_name)
+    naive = tuple(t for t in spec.typed_instants() if is_naive(t))
+    local = local_zone()
+    if not naive or is_utc(local):
+        return UTC
+    if not _interactive():
+        err.print(
+            f"{', '.join(naive)} read as UTC; pass --tz (or set MONGOOPS_TZ) for another zone",
+            style="dim",
+            markup=False,
+        )
+        return UTC
+    return _ask_zone(naive[0], local)
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def _ask_zone(sample: str, local: tzinfo) -> tzinfo:
+    """Ask once whether a date/time without an offset is UTC or this machine's zone."""
+    as_utc, as_local = parse_instant_ms(sample, tz=UTC), parse_instant_ms(sample, tz=local)
+    err.print(
+        f'"{sample}" has no time zone:\n'
+        f"  u  UTC           {format_instant(as_utc, UTC)}"
+        f"  (= {format_instant(as_utc, local)} here)\n"
+        f"  l  this machine  {format_instant(as_local, local)}"
+        f"  (= {format_instant(as_local, UTC)})",
+        markup=False,
+        highlight=False,
+    )
+    choice = typer.prompt("Read it as [u/l]", default="u", value_proc=_zone_choice, err=True)
+    return local if choice == "l" else UTC
+
+
+def _zone_choice(answer: str) -> str:
+    choice = answer.strip().lower()[:1]
+    if choice not in ("u", "l"):
+        raise typer.BadParameter("answer u (UTC) or l (this machine)")
+    return choice
+
+
+def _window_text(window: TimeWindow, tz: tzinfo, *, default: str = "") -> str:
+    return describe_window(window, tz) or default
+
+
+# --- output -----------------------------------------------------------------------------------
+
+
+def _emit(
+    lines: Iterable[SourceLine],
+    analyze: AnalyzeOptions,
+    out: OutputOptions,
+    warnings: Sequence[str] = (),
+) -> None:
     findings: tuple[Finding, ...] = tuple(analyze_lines(lines, analyze))
+    # ``warnings`` is filled by the progress callback while ``lines`` is drained above.
+    meta = replace(out.meta, warnings=(*out.meta.warnings, *warnings))
     text = render(
         findings,
         fmt=out.fmt.value,
         view=out.view.value,
         max_detail_rows=out.max_rows if out.fmt == Fmt.table else None,
-        meta=out.meta,
+        meta=meta,
     )
     if out.output:
         _write(out.output, text)
@@ -178,10 +301,13 @@ def _emit(lines: Iterable[SourceLine], analyze: AnalyzeOptions, out: OutputOptio
     else:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
     if out.html:
-        _write(out.html, render(findings, fmt="html", view="both", meta=out.meta))
+        _write(out.html, render(findings, fmt="html", view="both", meta=meta))
         # soft_wrap keeps the URI on one line so terminals can make it clickable
         err.print(f"[green]Dashboard: {out.html.resolve().as_uri()}[/green]", soft_wrap=True)
-    err.print(f"[dim]{len(findings)} regex usage(s) found[/dim]")
+    window = f", window {meta.window}" if meta.window else ""
+    err.print(
+        f"{len(findings)} regex usage(s) found{window}", style="dim", markup=False, soft_wrap=True
+    )
     blocking = tuple(r for r in summarize(findings) if r.remedy in out.fail_on)
     if blocking:
         for r in blocking:
@@ -194,11 +320,23 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _progress(origin: str, count: int) -> None:
-    err.print(f"[dim]{origin}: {count} slow query line(s)[/dim]")
+def _progress(n_logs: int, warnings: list[str]) -> sources.ProgressFn:
+    """Report per-node line counts; flag nodes that hit the cap (their window is incomplete)."""
+
+    def report(origin: str, count: int) -> None:
+        err.print(f"[dim]{origin}: {count} slow query line(s)[/dim]")
+        if count >= n_logs:
+            note = (
+                f"{origin} returned {count:,} lines, the --n-logs cap: part of the window is "
+                "missing; narrow it with --since/--until or --at/--around"
+            )
+            warnings.append(note)
+            err.print(f"warning: {note}", style="yellow", markup=False)
+
+    return report
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     err.print(f"[red]error:[/red] {message}")
     raise typer.Exit(code=2)
 
@@ -231,7 +369,11 @@ def atlas(
         str, typer.Option(envvar="MONGODB_ATLAS_OPS_MANAGER_URL", help="Atlas API base URL.")
     ] = atlas_api.DEFAULT_BASE_URL,
     since: SinceOpt = None,
+    until: UntilOpt = None,
     duration: DurationOpt = None,
+    at: AtOpt = None,
+    around: AroundOpt = None,
+    tz: TzOpt = None,
     n_logs: NLogsOpt = 20_000,
     namespace: NamespaceOpt = None,
     include_getmore: IncludeGetMoreOpt = False,
@@ -250,6 +392,7 @@ def atlas(
     """
     try:
         gate = parse_fail_on(fail_on)
+        window, zone = _resolve_time(WindowSpec(since, until, duration, at, around), tz)
     except ValueError as exc:
         _fail(str(exc))
     if not cluster and not process:
@@ -272,22 +415,24 @@ def atlas(
             meta = _meta(
                 "atlas",
                 f"{target} (project {project_id})",
-                since=since or "24h (API default)",
-                duration=duration,
+                window=_window_text(window, zone, default=API_DEFAULT_WINDOW),
                 namespaces=namespace,
                 min_ms=min_ms,
                 include_getmore=include_getmore,
+                tz=zone,
             )
+            warnings: list[str] = []
             _emit(
                 sources.atlas_lines(
                     client,
                     project_id,
                     processes,
-                    _window(since, duration, namespace, n_logs),
-                    _progress,
+                    _api_window(window, namespace, n_logs),
+                    _progress(n_logs, warnings),
                 ),
                 _analyze_options(namespace, include_getmore, min_ms),
                 OutputOptions(fmt, view, output, max_rows, meta, html, gate),
+                warnings,
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
@@ -326,7 +471,11 @@ def ops_manager(
     ] = None,
     insecure: Annotated[bool, typer.Option("--insecure", help="Skip TLS verification.")] = False,
     since: SinceOpt = None,
+    until: UntilOpt = None,
     duration: DurationOpt = None,
+    at: AtOpt = None,
+    around: AroundOpt = None,
+    tz: TzOpt = None,
     n_logs: NLogsOpt = 20_000,
     namespace: NamespaceOpt = None,
     include_getmore: IncludeGetMoreOpt = False,
@@ -345,6 +494,7 @@ def ops_manager(
     """
     try:
         gate = parse_fail_on(fail_on)
+        window, zone = _resolve_time(WindowSpec(since, until, duration, at, around), tz)
     except ValueError as exc:
         _fail(str(exc))
     env_cfg = ops_manager_api.config_from_env()
@@ -371,22 +521,24 @@ def ops_manager(
             meta = _meta(
                 "ops-manager",
                 f"{scope} (project {project_id}, {cfg.base_url})",
-                since=since or "24h (API default)",
-                duration=duration,
+                window=_window_text(window, zone, default=API_DEFAULT_WINDOW),
                 namespaces=namespace,
                 min_ms=min_ms,
                 include_getmore=include_getmore,
+                tz=zone,
             )
+            warnings: list[str] = []
             _emit(
                 sources.ops_manager_lines(
                     client,
                     project_id,
                     hosts,
-                    _window(since, duration, namespace, n_logs),
-                    _progress,
+                    _api_window(window, namespace, n_logs),
+                    _progress(n_logs, warnings),
                 ),
                 _analyze_options(namespace, include_getmore, min_ms),
                 OutputOptions(fmt, view, output, max_rows, meta, html, gate),
+                warnings,
             )
     except (ApiError, ValueError) as exc:
         _fail(str(exc))
@@ -397,6 +549,12 @@ def logfile(
     path: Annotated[
         str, typer.Argument(help="mongod log file (.log or .log.gz), or '-' for stdin.")
     ],
+    since: SinceOpt = None,
+    until: UntilOpt = None,
+    duration: DurationOpt = None,
+    at: AtOpt = None,
+    around: AroundOpt = None,
+    tz: TzOpt = None,
     namespace: NamespaceOpt = None,
     include_getmore: IncludeGetMoreOpt = False,
     min_ms: MinDurationOpt = 0,
@@ -407,9 +565,13 @@ def logfile(
     max_rows: MaxRowsOpt = 50,
     fail_on: FailOnOpt = None,
 ) -> None:
-    """Parse a mongod log file directly (EA without Ops Manager, or exported Atlas logs)."""
+    """Parse a mongod log file directly (EA without Ops Manager, or exported Atlas logs).
+
+    The time-window flags filter on each line's own timestamp; without them the whole file is read.
+    """
     try:
         gate = parse_fail_on(fail_on)
+        window, zone = _resolve_time(WindowSpec(since, until, duration, at, around), tz)
     except ValueError as exc:
         _fail(str(exc))
     if path != "-" and not Path(path).exists():
@@ -417,13 +579,15 @@ def logfile(
     meta = _meta(
         "logfile",
         "stdin" if path == "-" else path,
+        window=_window_text(window, zone),
         namespaces=namespace,
         min_ms=min_ms,
         include_getmore=include_getmore,
+        tz=zone,
     )
     _emit(
         sources.file_lines(path),
-        _analyze_options(namespace, include_getmore, min_ms),
+        _analyze_options(namespace, include_getmore, min_ms, window),
         OutputOptions(fmt, view, output, max_rows, meta, html, gate),
     )
 
@@ -431,6 +595,12 @@ def logfile(
 @app.command()
 def live(
     uri: Annotated[str, typer.Option("--uri", envvar="MONGODB_URI", help="Connection string.")],
+    since: SinceOpt = None,
+    until: UntilOpt = None,
+    duration: DurationOpt = None,
+    at: AtOpt = None,
+    around: AroundOpt = None,
+    tz: TzOpt = None,
     namespace: NamespaceOpt = None,
     include_getmore: IncludeGetMoreOpt = False,
     min_ms: MinDurationOpt = 0,
@@ -441,23 +611,31 @@ def live(
     max_rows: MaxRowsOpt = 50,
     fail_on: FailOnOpt = None,
 ) -> None:
-    """Read the server's in-memory log (getLog) over a live connection; handy for atlas-local."""
+    """Read the server's in-memory log (getLog) over a live connection; handy for atlas-local.
+
+    The buffer only holds the last ~1024 lines, so the time-window flags can only narrow it.
+    """
     try:
         gate = parse_fail_on(fail_on)
+        window, zone = _resolve_time(WindowSpec(since, until, duration, at, around), tz)
     except ValueError as exc:
         _fail(str(exc))
     meta = _meta(
         "live",
         f"{_redact_uri(uri)} (getLog ring buffer)",
+        window=_window_text(window, zone),
         namespaces=namespace,
         min_ms=min_ms,
         include_getmore=include_getmore,
+        tz=zone,
     )
     try:
         _emit(
             sources.getlog_lines(uri),
-            _analyze_options(namespace, include_getmore, min_ms),
+            _analyze_options(namespace, include_getmore, min_ms, window),
             OutputOptions(fmt, view, output, max_rows, meta, html, gate),
         )
+    except typer.Exit:
+        raise
     except Exception as exc:  # pymongo raises many connection error types
         _fail(f"{type(exc).__name__}: {exc}")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 from mongoops.regex_finder.detector import RegexCategory
 
@@ -18,7 +19,8 @@ from mongoops.regex_finder.detector import RegexCategory
 class Remedy(StrEnum):
     NONE = "none"  # index-friendly already
     BTREE_INDEX = "btree_index"  # prefix regex but no index on the field
-    COLLATION_INDEX = "collation_index"  # case-insensitive prefix / exact -> collation
+    COLLATION_INDEX = "collation_index"  # case-insensitive exact match -> equality + collation
+    NORMALIZED_FIELD = "normalized_field"  # case-insensitive prefix -> lower-cased copy
     REVERSED_FIELD = "reversed_field"  # suffix match on an identifier -> reversed copy
     SEARCH = "search"  # MongoDB Search (Atlas or self-managed mongot)
     FIX_FILTER = "fix_filter"  # write-path regex: Search not applicable
@@ -35,7 +37,8 @@ class Recommendation:
 REMEDY_LABEL: dict[Remedy, str] = {
     Remedy.NONE: "No action",
     Remedy.BTREE_INDEX: "Add a regular index",
-    Remedy.COLLATION_INDEX: "Collation index",
+    Remedy.COLLATION_INDEX: "Equality match + collation index",
+    Remedy.NORMALIZED_FIELD: "Lower-cased field + prefix index",
     Remedy.REVERSED_FIELD: "Reversed field + prefix index",
     Remedy.SEARCH: "MongoDB Search",
     Remedy.FIX_FILTER: "Fix the write filter",
@@ -49,11 +52,28 @@ REMEDY_ORDER: dict[Remedy, int] = {
     Remedy.MONITOR: 1,
     Remedy.BTREE_INDEX: 2,
     Remedy.COLLATION_INDEX: 3,
-    Remedy.REVERSED_FIELD: 4,
-    Remedy.REWRITE: 5,
-    Remedy.FIX_FILTER: 6,
-    Remedy.SEARCH: 7,
+    Remedy.NORMALIZED_FIELD: 4,
+    Remedy.REVERSED_FIELD: 5,
+    Remedy.REWRITE: 6,
+    Remedy.FIX_FILTER: 7,
+    Remedy.SEARCH: 8,
 }
+
+# Who has to do what, so an operator can tell a DBA-only fix from an app release or a budget line.
+REMEDY_EFFORT: dict[Remedy, str] = {
+    Remedy.NONE: "nothing to do",
+    Remedy.MONITOR: "nothing to do yet",
+    Remedy.BTREE_INDEX: "index only",
+    Remedy.COLLATION_INDEX: "index + query change",
+    Remedy.NORMALIZED_FIELD: "app change + backfill",
+    Remedy.REVERSED_FIELD: "app change + backfill",
+    Remedy.REWRITE: "app change",
+    Remedy.FIX_FILTER: "app change",
+    Remedy.SEARCH: "new infrastructure",
+}
+
+# Shapes that need no work now; reports list them apart from the action plan.
+NO_ACTION = frozenset({Remedy.NONE, Remedy.MONITOR})
 
 SEARCH_DEPLOYMENT_NOTE = (
     "MongoDB Search needs Atlas M10+ (optionally dedicated Search Nodes) or, self-managed, "
@@ -106,12 +126,16 @@ def recommend(
                 "in the preceding filter.",
             )
         if _is_prefix_shape(pattern) and literal and not write_path:
+            target = (
+                f"{field_hint}_lower: /^{literal.lower()}/ }} on a lower-cased copy of the field "
+                "($regex cannot use a case-insensitive index)"
+                if "i" in options
+                else f"{field_hint}: /^{literal}/ }}"
+            )
             return Recommendation(
                 Remedy.REWRITE,
                 f"{operator} inside $expr can never use an index. Move it to a plain predicate "
-                f"{{ {field_hint}: /^{literal}/{options} }}"
-                + (" with a collation index" if "i" in options else "")
-                + " so the prefix becomes an index range scan.",
+                f"{{ {target} so the prefix becomes an index range scan.",
             )
         # Unanchored inside $expr: same options as a plain unanchored regex (below), the
         # instruction to leave $expr is implied by every remedy.
@@ -132,12 +156,21 @@ def recommend(
             )
         return Recommendation(Remedy.NONE, "Case-sensitive prefix regex range-scans the index.")
 
-    if category is RegexCategory.CASE_INSENSITIVE and _is_prefix_shape(pattern) and literal:
+    if category is RegexCategory.CASE_INSENSITIVE and _is_exact_shape(pattern) and literal:
         return Recommendation(
             Remedy.COLLATION_INDEX,
-            "Case-insensitive prefix/exact match: create a collation index "
-            f'({{ {field_hint}: 1 }}, {{ collation: {{ locale: "en", strength: 2 }} }}) and query '
-            f'with the same collation using a case-sensitive prefix (^{literal}) instead of "i".',
+            "Case-insensitive exact match: replace the regex with an equality "
+            f'{{ {field_hint}: "{literal}" }} run with collation {{ locale: "en", strength: 2 }} '
+            "and create an index with the same collation. $regex itself cannot use a "
+            "case-insensitive index.",
+        )
+
+    if category is RegexCategory.CASE_INSENSITIVE and _is_prefix_shape(pattern) and literal:
+        return Recommendation(
+            Remedy.NORMALIZED_FIELD,
+            "Case-insensitive prefix: $regex cannot use a case-insensitive (collation) index. "
+            f"Store a lower-cased copy ({field_hint}_lower), index it, and query "
+            f"{{ {field_hint}_lower: /^{literal.lower()}/ }} which range-scans the index.",
         )
 
     if _is_suffix_shape(pattern) and literal and _looks_like_identifier(literal):
@@ -150,7 +183,8 @@ def recommend(
     if write_path:
         return Recommendation(
             Remedy.FIX_FILTER,
-            f"$search cannot be used in a {command} filter. Narrow the filter with an equality or "
+            f"$search cannot be used in {_article(command or '')} {command} filter. Narrow the "
+            "filter with an equality or "
             "case-sensitive prefix on an indexed field, or run $search first to collect _ids and "
             f"then {command} by _id.",
         )
@@ -189,8 +223,17 @@ def literal_body(pattern: str) -> str:
     return body.replace("\x00", ".")
 
 
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" and word else "a"
+
+
 def _is_prefix_shape(pattern: str) -> bool:
     return pattern.startswith("^") and not pattern.startswith("^.*")
+
+
+def _is_exact_shape(pattern: str) -> bool:
+    """``^literal$``: the whole value, so an equality can replace the regex."""
+    return _is_prefix_shape(pattern) and pattern.endswith("$") and not pattern.endswith(".*$")
 
 
 def _is_suffix_shape(pattern: str) -> bool:
@@ -216,19 +259,28 @@ def _heavy_scan(scanned: int, nreturned: int | None, collscan: bool) -> bool:
     return collscan and ratio >= _MIN_SCAN_RATIO
 
 
-def _search_how(category: RegexCategory, options: str, literal: str, field: str) -> str:
+SearchOperator = Literal["wildcard", "regex", "phrase", "text"]
+
+_SEARCH_OPERATOR_HOW: dict[SearchOperator, str] = {
+    "wildcard": "the wildcard operator over a keyword-analyzed field "
+    "(or autocomplete with an nGram tokenizer for type-ahead)",
+    "regex": "the regex operator over a keyword-analyzed field",
+    "phrase": "the phrase operator with the standard analyzer (the words in order, "
+    "case-insensitive), or autocomplete for type-ahead",
+    "text": "the text operator with the standard analyzer (case-insensitive word matching), "
+    "or autocomplete for type-ahead",
+}
+
+
+def search_operator(category: RegexCategory, options: str, literal: str) -> SearchOperator:
+    """The $search operator for a regex shape; keyword-analyzed for wildcard/regex."""
     if category is RegexCategory.LEADING_WILDCARD or not literal:
-        operator = (
-            "the wildcard/regex operator over a keyword-analyzed field "
-            "(or autocomplete with an nGram tokenizer for type-ahead)"
-        )
-    elif "i" in options or " " in literal:
-        operator = (
-            "the text operator with the standard analyzer (case-insensitive word matching), "
-            "or autocomplete for type-ahead"
-        )
-    else:
-        operator = "the text or phrase operator (standard analyzer), or autocomplete for type-ahead"
+        return "wildcard" if literal else "regex"
+    return "phrase" if " " in literal and "i" not in options else "text"
+
+
+def _search_how(category: RegexCategory, options: str, literal: str, field: str) -> str:
+    operator = _SEARCH_OPERATOR_HOW[search_operator(category, options, literal)]
     return (
         f"Unanchored matching on free text scans every key. Create a MongoDB Search index on "
         f"{field} and query it with $search as the first aggregation stage using {operator}."
